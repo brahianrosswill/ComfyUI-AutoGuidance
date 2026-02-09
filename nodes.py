@@ -5,6 +5,9 @@ from typing import Any, Dict, List
 
 import comfy.sampler_helpers
 import comfy.samplers
+import comfy.model_patcher
+import comfy.patcher_extension
+import comfy.hooks
 
 
 class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
@@ -33,6 +36,71 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         self.cfg = float(cfg)
         self.w_ag = float(w_ag)
 
+    def outer_sample(
+        self,
+        noise,
+        latent_image,
+        sampler,
+        sigmas,
+        denoise_mask=None,
+        callback=None,
+        disable_pbar=False,
+        seed=None,
+    ):
+        self.inner_model, self.conds, loaded_good = comfy.sampler_helpers.prepare_sampling(
+            self.model_patcher, noise.shape, self.conds, self.model_options
+        )
+        self.inner_bad_model, self.bad_conds, loaded_bad = comfy.sampler_helpers.prepare_sampling(
+            self.bad_model_patcher, noise.shape, self.bad_conds, self.model_options
+        )
+
+        seen = set()
+        loaded_all = []
+        for model in (loaded_good + loaded_bad):
+            model_id = id(model)
+            if model_id in seen:
+                continue
+            seen.add(model_id)
+            loaded_all.append(model)
+        self.loaded_models = loaded_all
+
+        device = self.model_patcher.load_device
+
+        if denoise_mask is not None:
+            denoise_mask = comfy.sampler_helpers.prepare_mask(denoise_mask, noise.shape, device)
+
+        noise = noise.to(device)
+        latent_image = latent_image.to(device)
+        sigmas = sigmas.to(device)
+
+        comfy.samplers.cast_to_load_options(self.model_options, device=device, dtype=self.model_patcher.model_dtype())
+
+        try:
+            self.model_patcher.pre_run()
+            self.bad_model_patcher.pre_run()
+
+            output = self.inner_sample(
+                noise, latent_image, device, sampler, sigmas, denoise_mask, callback, disable_pbar, seed
+            )
+        finally:
+            comfy.samplers.cast_to_load_options(self.model_options, device=self.model_patcher.offload_device)
+            self.bad_model_patcher.cleanup()
+            self.model_patcher.cleanup()
+
+            cleanup_conds = {}
+            keys = set(self.conds.keys()) | (set(self.bad_conds.keys()) if self.bad_conds else set())
+            for k in keys:
+                cleanup_conds[k] = (self.conds.get(k, []) or []) + (
+                    (self.bad_conds.get(k, []) or []) if self.bad_conds else []
+                )
+            comfy.sampler_helpers.cleanup_models(cleanup_conds, self.loaded_models)
+
+            del self.inner_model
+            del self.inner_bad_model
+            del self.loaded_models
+
+        return output
+
     def sample(
         self,
         noise,
@@ -45,70 +113,59 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         seed=None,
     ):
         """
-        Override CFGGuider.sample so BOTH good and bad models go through prepare_sampling()
-        and get cleaned up via cleanup_models().
-
-        This mirrors comfy.samplers.CFGGuider.sample's lifecycle.
+        Override CFGGuider.sample to mirror upstream CFGGuider sample/outer_sample lifecycle,
+        extended to prepare BOTH the good and bad models.
         """
         if sigmas.shape[-1] == 0:
             return latent_image
 
-        # ComfyUI's prepare_sampling now expects a non-None model_options dict
-        # (wrapper plumbing uses model_options.get(...)).
-        model_options = getattr(self, "model_options", None)
-        if not isinstance(model_options, dict):
-            model_options = {"transformer_options": {}}
-            self.model_options = model_options
-        else:
-            # Some setups may have transformer_options missing/None; make it a dict.
-            if model_options.get("transformer_options", None) is None:
-                model_options["transformer_options"] = {}
-
         self.conds = {}
+        self.bad_conds = {}
         for k in self.original_conds:
             self.conds[k] = list(map(lambda a: a.copy(), self.original_conds[k]))
+            self.bad_conds[k] = list(map(lambda a: a.copy(), self.original_conds[k]))
 
-        self.inner_model, self.conds, loaded_good = comfy.sampler_helpers.prepare_sampling(
-            self.model_patcher, noise.shape, self.conds, model_options=model_options
-        )
-
-        bad_conds = {}
-        for k in self.original_conds:
-            bad_conds[k] = list(map(lambda a: a.copy(), self.original_conds[k]))
-
-        self.inner_bad_model, self.bad_conds, loaded_bad = comfy.sampler_helpers.prepare_sampling(
-            self.bad_model_patcher, noise.shape, bad_conds, model_options=model_options
-        )
-
-        self.loaded_models = loaded_good + loaded_bad
-
-        device = self.model_patcher.load_device
-
-        if denoise_mask is not None:
-            denoise_mask = comfy.sampler_helpers.prepare_mask(denoise_mask, noise.shape, device)
-
-        noise = noise.to(device)
-        latent_image = latent_image.to(device)
-        sigmas = sigmas.to(device)
+        comfy.samplers.preprocess_conds_hooks(self.conds)
+        comfy.samplers.preprocess_conds_hooks(self.bad_conds)
 
         try:
-            output = self.inner_sample(
-                noise, latent_image, device, sampler, sigmas, denoise_mask, callback, disable_pbar, seed
-            )
-        finally:
-            cleanup_conds = {}
-            keys = set(self.conds.keys()) | (set(self.bad_conds.keys()) if self.bad_conds else set())
-            for k in keys:
-                cleanup_conds[k] = (self.conds.get(k, []) or []) + (
-                    (self.bad_conds.get(k, []) or []) if self.bad_conds else []
-                )
-            comfy.sampler_helpers.cleanup_models(cleanup_conds, self.loaded_models)
+            orig_model_options = self.model_options
+            if not isinstance(self.model_options, dict):
+                self.model_options = {}
+            self.model_options = comfy.model_patcher.create_model_options_clone(self.model_options)
+            self.model_options.setdefault("transformer_options", {})
 
-        del self.inner_model
-        del self.inner_bad_model
-        del self.conds
-        del self.bad_conds
-        del self.loaded_models
+            orig_hook_mode_good = self.model_patcher.hook_mode
+            orig_hook_mode_bad = self.bad_model_patcher.hook_mode
+            if comfy.samplers.get_total_hook_groups_in_conds(self.conds) <= 1:
+                self.model_patcher.hook_mode = comfy.hooks.EnumHookMode.MinVram
+                self.bad_model_patcher.hook_mode = comfy.hooks.EnumHookMode.MinVram
+
+            comfy.sampler_helpers.prepare_model_patcher(self.model_patcher, self.conds, self.model_options)
+            comfy.sampler_helpers.prepare_model_patcher(self.bad_model_patcher, self.bad_conds, self.model_options)
+
+            comfy.samplers.filter_registered_hooks_on_conds(self.conds, self.model_options)
+            comfy.samplers.filter_registered_hooks_on_conds(self.bad_conds, self.model_options)
+
+            executor = comfy.patcher_extension.WrapperExecutor.new_class_executor(
+                self.outer_sample,
+                self,
+                comfy.patcher_extension.get_all_wrappers(
+                    comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, self.model_options, is_model_options=True
+                ),
+            )
+            output = executor.execute(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed)
+        finally:
+            comfy.samplers.cast_to_load_options(self.model_options, device=self.model_patcher.offload_device)
+
+            self.model_options = orig_model_options
+            self.model_patcher.hook_mode = orig_hook_mode_good
+            self.bad_model_patcher.hook_mode = orig_hook_mode_bad
+            self.model_patcher.restore_hook_patches()
+            self.bad_model_patcher.restore_hook_patches()
+
+            del self.conds
+            del self.bad_conds
 
         return output
 
@@ -123,9 +180,6 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         if model_options.get("transformer_options", None) is None:
             model_options["transformer_options"] = {}
 
-        # Keep a reference so sample() can reuse it if needed
-        self.model_options = model_options
-
         positive_cond = self.conds.get("positive", None)
         negative_cond = self.conds.get("negative", None)
 
@@ -135,6 +189,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             uncond_for_good = negative_cond
 
         conds_good: List[Any] = [positive_cond, uncond_for_good]
+        self.inner_model.current_patcher = self.model_patcher
         out_good = comfy.samplers.calc_cond_batch(
             self.inner_model,
             conds_good,
@@ -181,6 +236,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
         pos_bad_cond = (self.bad_conds.get("positive", None) if self.bad_conds else None) or positive_cond
         conds_bad: List[Any] = [pos_bad_cond, None]
+        self.inner_bad_model.current_patcher = self.bad_model_patcher
         out_bad = comfy.samplers.calc_cond_batch(
             self.inner_bad_model,
             conds_bad,
