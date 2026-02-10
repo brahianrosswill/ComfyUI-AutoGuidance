@@ -4,6 +4,7 @@ import math
 from collections.abc import Mapping
 from typing import Any, Dict, List
 
+import torch
 import comfy.sampler_helpers
 import comfy.samplers
 import comfy.model_patcher
@@ -66,6 +67,122 @@ def _ensure_y_everywhere(cond: Any, y_ref) -> None:
                 _ensure_y_everywhere(v, y_ref)
 
 
+def _restore_y_per_entry(dst_cond: Any, src_pos: Any, src_neg: Any = None) -> Any:
+    """
+    Restore SDXL class label 'y' WITHOUT collapsing multi-entry conditionings.
+    For list conditionings, copy per-index y from src_pos/src_neg into dst_cond.
+    """
+    is_tuple = isinstance(dst_cond, tuple)
+    if isinstance(dst_cond, (list, tuple)):
+        dst_list = list(dst_cond)
+        src_pos_list = list(src_pos) if isinstance(src_pos, (list, tuple)) else None
+        src_neg_list = list(src_neg) if isinstance(src_neg, (list, tuple)) else None
+
+        y_default = _find_first_y(src_pos) or _find_first_y(src_neg)
+
+        for i in range(len(dst_list)):
+            y_ref = None
+            if src_pos_list is not None and i < len(src_pos_list):
+                y_ref = _find_first_y(src_pos_list[i])
+            if y_ref is None and src_neg_list is not None and i < len(src_neg_list):
+                y_ref = _find_first_y(src_neg_list[i])
+            if y_ref is None:
+                y_ref = y_default
+
+            if y_ref is not None:
+                _ensure_y_everywhere(dst_list[i], y_ref)
+
+        return tuple(dst_list) if is_tuple else dst_list
+
+    y_ref = _find_first_y(src_pos) or _find_first_y(src_neg)
+    if y_ref is not None:
+        _ensure_y_everywhere(dst_cond, y_ref)
+    return dst_cond
+
+
+def _looks_like_tensor(v: Any) -> bool:
+    return torch.is_tensor(v)
+
+
+def _looks_like_tensorish(v: Any) -> bool:
+    if _looks_like_tensor(v):
+        return True
+    if isinstance(v, (list, tuple)) and v and all(_looks_like_tensor(x) for x in v):
+        return True
+    return False
+
+
+def _tensorish_width(v: Any) -> int | None:
+    if _looks_like_tensor(v):
+        return int(v.shape[-1])
+    if isinstance(v, (list, tuple)) and v and all(_looks_like_tensor(x) for x in v):
+        return sum(int(x.shape[-1]) for x in v)
+    return None
+
+
+def _coerce_tensorish_to_tensor(v: Any):
+    if _looks_like_tensor(v):
+        return v
+    if isinstance(v, (list, tuple)) and v and all(_looks_like_tensor(x) for x in v):
+        try:
+            return torch.cat(list(v), dim=-1)
+        except Exception:
+            return v
+    return v
+
+
+def _ensure_primary_text_cond(dst_cond: Any, src_cond: Any) -> Any:
+    """
+    Ensure the primary conditioning tensor (the first element of each cond item)
+    exists and matches src's embedding width. This prevents SDXL cross-attn from
+    seeing context=None and falling back to self-attn (640-dim).
+    """
+    is_tuple = isinstance(dst_cond, tuple)
+    if isinstance(dst_cond, (list, tuple)) and isinstance(src_cond, (list, tuple)):
+        dst_list = list(dst_cond)
+        src_list = list(src_cond)
+        n = min(len(dst_list), len(src_list))
+        for i in range(n):
+            d = dst_list[i]
+            s = src_list[i]
+
+            d0 = d[0] if isinstance(d, (list, tuple)) and len(d) >= 1 else None
+            s0 = s[0] if isinstance(s, (list, tuple)) and len(s) >= 1 else None
+
+            if not _looks_like_tensorish(s0):
+                continue
+
+            s0_t = _coerce_tensorish_to_tensor(s0)
+            if not _looks_like_tensor(s0_t):
+                continue
+            d0_t = _coerce_tensorish_to_tensor(d0)
+
+            dw = _tensorish_width(d0_t)
+            sw = _tensorish_width(s0_t)
+
+            if sw is None:
+                continue
+
+            if isinstance(d, tuple):
+                needs_replace = (dw is None) or (dw != sw) or (not _looks_like_tensor(d0_t))
+                if needs_replace:
+                    dst_list[i] = (s0_t, *d[1:])
+                elif d0 is not d0_t:
+                    dst_list[i] = (d0_t, *d[1:])
+            elif isinstance(d, list):
+                if len(d) >= 1:
+                    needs_replace = (dw is None) or (dw != sw) or (not _looks_like_tensor(d0_t))
+                    if needs_replace:
+                        d[0] = s0_t
+                    elif d0 is not d0_t:
+                        d[0] = d0_t
+                else:
+                    dst_list[i] = [s0_t]
+        return tuple(dst_list) if is_tuple else dst_list
+
+    return dst_cond
+
+
 class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
     """
     AutoGuidance + CFG guider.
@@ -110,13 +227,15 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             self.bad_model_patcher, noise.shape, self.bad_conds, self.model_options
         )
         # SDXL class-conditional models require 'y'. Some hook/filter stacks drop it for the bad model.
-        # Only restore 'y' (do NOT merge other tensors like c_crossattn / embeddings).
+        # Restore 'y' per conditioning entry (do NOT merge other tensors like embeddings).
         if self.bad_conds and self.conds:
-            y_ref = _find_first_y(self.conds.get("positive", None)) or _find_first_y(self.conds.get("negative", None))
             bad_positive = self.bad_conds.get("positive", None)
-            if y_ref is not None and bad_positive is not None:
+            good_positive = self.conds.get("positive", None)
+            good_negative = self.conds.get("negative", None)
+
+            if bad_positive is not None and (good_positive is not None or good_negative is not None):
                 bad_positive = _clone_cond_metadata(bad_positive)
-                _ensure_y_everywhere(bad_positive, y_ref)
+                bad_positive = _restore_y_per_entry(bad_positive, good_positive, good_negative)
                 self.bad_conds["positive"] = bad_positive
 
         seen = set()
@@ -296,6 +415,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
         # Prefer bad-model filtered conds for hook compatibility, but restore 'y' if required.
         pos_bad_cond = self.bad_conds["positive"] if self.bad_conds and "positive" in self.bad_conds else positive_cond
+        pos_bad_cond = _clone_cond_metadata(pos_bad_cond)
+
+        pos_bad_cond = _restore_y_per_entry(pos_bad_cond, positive_cond, negative_cond)
+        pos_bad_cond = _ensure_primary_text_cond(pos_bad_cond, positive_cond)
+        if self.bad_conds is not None:
+            self.bad_conds["positive"] = pos_bad_cond
 
         # IMPORTANT: Some SDXL-style class-conditional models require "y".
         # Passing `None` as a second conditioning can drop those and trip
@@ -303,32 +428,45 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         # So: run ONLY a single conditional forward for the bad model.
         conds_bad_single: List[Any] = [pos_bad_cond]
         self.inner_bad_model.current_patcher = self.bad_model_patcher
-        try:
-            out_bad_single = comfy.samplers.calc_cond_batch(
+
+        def _run_bad(conds_list: List[Any]) -> List[Any]:
+            return comfy.samplers.calc_cond_batch(
                 self.inner_bad_model,
-                conds_bad_single,
+                conds_list,
                 x,
                 timestep,
                 model_options,
             )
+
+        try:
+            out_bad_single = _run_bad(conds_bad_single)
         except AssertionError as e:
             if "must specify y if and only if the model is class-conditional" not in str(e):
                 raise
-            y_ref = _find_first_y(positive_cond)
-            if y_ref is None:
-                raise
             pos_bad_cond = _clone_cond_metadata(pos_bad_cond)
-            _ensure_y_everywhere(pos_bad_cond, y_ref)
+            pos_bad_cond = _restore_y_per_entry(pos_bad_cond, positive_cond, negative_cond)
+            pos_bad_cond = _ensure_primary_text_cond(pos_bad_cond, positive_cond)
             if self.bad_conds is not None:
                 self.bad_conds["positive"] = pos_bad_cond
             conds_bad_single = [pos_bad_cond]
-            out_bad_single = comfy.samplers.calc_cond_batch(
-                self.inner_bad_model,
-                conds_bad_single,
-                x,
-                timestep,
-                model_options,
-            )
+            try:
+                out_bad_single = _run_bad(conds_bad_single)
+            except RuntimeError as e2:
+                if "mat1 and mat2 shapes cannot be multiplied" not in str(e2):
+                    raise
+                pos_bad_cond = _clone_cond_metadata(positive_cond)
+                if self.bad_conds is not None:
+                    self.bad_conds["positive"] = pos_bad_cond
+                conds_bad_single = [pos_bad_cond]
+                out_bad_single = _run_bad(conds_bad_single)
+        except RuntimeError as e:
+            if "mat1 and mat2 shapes cannot be multiplied" not in str(e):
+                raise
+            pos_bad_cond = _clone_cond_metadata(positive_cond)
+            if self.bad_conds is not None:
+                self.bad_conds["positive"] = pos_bad_cond
+            conds_bad_single = [pos_bad_cond]
+            out_bad_single = _run_bad(conds_bad_single)
         bad_cond_pred = out_bad_single[0]
 
         # If any pre-cfg hooks exist, provide a 2-slot "view" (duplicate) for compatibility
