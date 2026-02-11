@@ -116,7 +116,7 @@ Internally this is used as a multiplier for the AutoGuidance delta direction (on
 
 ### `bad_conditional` (recommended default)
 Uses the most “LoRA-sensitive” direction in practice:
-- compare **good CFG output** vs **bad conditional output**
+- compare **good conditional output** vs **bad conditional output**
 
 This tends to show the biggest differences when you change LoRAs on the bad path.
 
@@ -124,14 +124,18 @@ This tends to show the biggest differences when you change LoRAs on the bad path
 Uses a raw difference direction between guided outputs. Can be harsher / less predictable.
 
 ### `project_cfg`
-Projects the “push-away-from-bad” direction onto the CFG direction.
+Projects the “push-away-from-bad” direction onto the **actual CFG update direction**.
 This keeps changes more aligned with CFG, often more conservative.
+
+### `reject_cfg`
+Removes the component of the “push-away-from-bad” direction that is parallel to the **actual CFG update direction**.
+This can increase composition changes when AG otherwise behaves like “CFG++”.
 
 ---
 
 ## Safety cap: `ag_max_ratio`
 
-AutoGuidance is capped relative to the magnitude of the CFG direction:
+AutoGuidance is capped relative to the magnitude of the **actual CFG update** (`cfg_out - uncond_good`):
 
 - Higher `ag_max_ratio` = stronger visible effect (up to destabilization if extreme)
 - Lower `ag_max_ratio` = subtler
@@ -200,6 +204,7 @@ Prints swap/patch diagnostics (patch counts, uuids, etc.)
 
 ### `debug_metrics`
 Prints direction / magnitude diagnostics (useful for confirming AG is actually being applied).
+It also logs active `sampler_post_cfg_function` hooks at step 0, which helps diagnose post-CFG rescale/clamp behavior that can suppress visible AG effects.
 
 ---
 
