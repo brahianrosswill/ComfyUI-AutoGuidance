@@ -214,10 +214,10 @@ Use `debug_swap` and look at `patch_info`:
 
 ## License
 
-MIT (see `LICENSE.txt`). Note: the included MIT template may still contain placeholders; update it if you intend to publish under your name.
+MIT (see `LICENSE.txt`).
 
 ---
 
 ## Credits / Reference
 
-AutoGuidance paper: 
+AutoGuidance paper: https://arxiv.org/abs/2406.02507
