@@ -1,14 +1,16 @@
 # ComfyUI-AutoGuidance
 
-Adds an **AutoGuidance + CFG** **GUIDER** node for **ComfyUI**, based on the paper:
+Adds an **AutoGuidance + CFG** **GUIDER** node for **ComfyUI**, based on:
 
-- **Guiding a Diffusion Model with a Bad Version of Itself** (arXiv:2406.02507) :contentReference[oaicite:1]{index=1}
-- Link: https://arxiv.org/abs/2406.02507
+- **Guiding a Diffusion Model with a Bad Version of Itself** (arXiv:2406.02507)  
+  https://arxiv.org/abs/2406.02507
 
-This node lets you guide a “good” diffusion model using a “bad” version of it, while still using normal CFG. In practice, you provide:
-- a **good_model** (the one you want),
-- a **bad_model** (intentionally worse / different),
-- and the node injects an AutoGuidance delta on top of CFG (with safety caps and ramp controls).
+This node lets you run normal CFG on a “good” model while also using a “bad” model to compute an additional **AutoGuidance delta** that is added on top of the CFG output (optionally capped and ramped over steps).
+
+You provide:
+- a **good_model** (what you actually want),
+- a **bad_model** (intentionally different/worse),
+- and this guider mixes them according to the selected **delta mode**, **cap**, and **ramp**.
 
 ---
 
@@ -18,223 +20,273 @@ Clone into:
 
 `ComfyUI/custom_nodes/ComfyUI-AutoGuidance`
 
-Then restart ComfyUI.
+Restart ComfyUI.
 
 ---
 
-## Quick Start (how to wire it)
+## Node
 
-1) Create your two models:
-- **good_model**: checkpoint + your normal LoRA stack (character LoRA, LCM/Lightning, style, etc.)
-- **bad_model**: checkpoint + a *worse/different* stack (examples below)
+- **AutoGuidance CFG Guider (good+bad)** → outputs a **GUIDER**  
+  Plug it into **SamplerCustomAdvanced** (GUIDER input).
 
-2) Add the node:
-- `AutoGuidance CFG Guider (good+bad)`
+---
 
-3) Plug it into:
-- `SamplerCustomAdvanced` (GUIDER input)
+## Quick wiring
+
+1) Load your two models:
+- `good_model`: your normal checkpoint + normal LoRA stack
+- `bad_model`: same base checkpoint (often), but intentionally different LoRA stack or setup
+
+2) Add:
+- **AutoGuidance CFG Guider (good+bad)**
+
+3) Connect:
+- its **GUIDER** output → **SamplerCustomAdvanced** → **GUIDER**
 
 That’s it.
 
 ---
 
-## Extremely important: `dual_models_2x_vram` REQUIRES a second checkpoint file path
+## Critical: `dual_models_2x_vram` requires two distinct model instances
 
-If you pick **`swap_mode = dual_models_2x_vram`**, you **must** load the checkpoint **twice as two distinct model instances**.
+`swap_mode = dual_models_2x_vram` is only “dual” if ComfyUI actually loads **two separate model objects**.
 
-In ComfyUI, if both loaders point to the *same* checkpoint path, Comfy’s model caching can yield a shared underlying model object. In that situation, `dual_models_2x_vram` **cannot actually be dual-model** and will **effectively behave like a shared-mode internally**, which is **dramatically slower** (people commonly see “order-of-magnitude” slowdowns vs normal CFG).
+ComfyUI can reuse/cache model instances when you load the *same* checkpoint path twice. If both “good” and “bad” end up referencing the same underlying model object, `dual_models_2x_vram` cannot behave as intended.
 
-### Do this (recommended)
-Make a second checkpoint file path and load each one:
+### Reliable way to force separation
 
-- Copy the checkpoint file (simple + reliable), e.g.
+Use two different checkpoint file paths:
+
+- Copy the checkpoint file (most reliable):
   - `model.safetensors` → `model_copy.safetensors`
-- Or use a filesystem hardlink if you know what you’re doing and your OS/filesystem supports it.
 
-Then in ComfyUI:
-- `CheckpointLoaderSimple` → load `model.safetensors` (good path)
-- `CheckpointLoaderSimple` → load `model_copy.safetensors` (bad path)
+Then load:
+- good loader → `model.safetensors`
+- bad loader → `model_copy.safetensors`
 
-Now `dual_models_2x_vram` will behave correctly and avoids the expensive patch/unpatch swapping overhead.
-
-**VRAM note:** dual-model mode uses ~2× the base checkpoint VRAM (plus LoRAs, plus activations).
-
----
-
-## Choosing a good “bad_model” (what actually works)
-
-AutoGuidance only does something meaningful if **good_model and bad_model produce meaningfully different predictions**.
-
-Practical bad-model recipes:
-- **Remove** the quality/style LoRA(s) from bad_model (good has them, bad doesn’t)
-- Use a **weaker/incorrect style LoRA** on bad_model
-- Use the same LoRA but at a **wrong weight** (too high, too low, or negative)
-- If good uses LCM/Lightning, try bad without it (or vice versa) to force a strong mismatch
-- Use a “bad prompt conditioning” strategy (less common): keep model same but feed bad_model a deliberately worse positive conditioning
-
-If you set bad_model too similar to good_model, AutoGuidance will be subtle no matter what.
+> Notes:
+> - Hardlinks/symlinks may or may not defeat caching depending on how your setup keys the cache.
+> - If you want maximum certainty, use an actual copy (different path + different file).
 
 ---
 
-## Node Parameters
+## What makes a “good” `bad_model`
 
-### Core knobs
+AutoGuidance only has leverage if **good_model and bad_model produce meaningfully different predictions** (at the denoiser output level). If they’re effectively the same, the delta direction is small or becomes visually negligible after other hooks.
 
-#### `cfg`
-Normal classifier-free guidance scale (same as usual).
+Ways to make `bad_model` meaningfully different (examples, not promises):
+- Remove some LoRAs on the bad path (good has them, bad doesn’t)
+- Use a different LoRA stack on the bad path (style/character/etc.)
+- Use the same LoRA at a deliberately different weight (including negative if your workflow supports it)
+- Change conditioning strategy on the bad path (e.g. different prompt conditioning / different text encoder path)
 
-#### `w_autoguide`
-Paper-style weight:
-- `w_autoguide = 1.0` → AutoGuidance effectively off
-- `2.0` → moderate
-- `3.0+` → strong
-
-Internally this is used as a multiplier for the AutoGuidance delta direction (on top of CFG).
+The point isn’t “worse” aesthetically—it’s **different** in a way that changes denoiser predictions.
 
 ---
 
-## Swap modes (performance + correctness)
+## Parameters
 
-### `shared_safe_low_vram` (default)
-- Lowest VRAM overhead
-- Most compatibility / correctness across Comfy variants
-- Can be **very slow** because it must swap LoRA stacks on a shared model safely
+### `cfg`
+
+Normal CFG scale. This node does not replace CFG; it adds an additional delta on top of it.
+
+### `w_autoguide`
+
+Paper-style parameterization:
+- `w_autoguide = 1.0` → AutoGuidance delta is effectively off
+- `w_autoguide > 1.0` → delta strength increases with `(w_autoguide - 1)`
+
+Internally the delta multiplier is:
+- `w = max(w_autoguide - 1, 0)`
+
+---
+
+## Swap modes
+
+### `shared_safe_low_vram`
+
+- Minimal extra VRAM
+- Most conservative/compatible swapping behavior
+- Slowest when bad/good stacks differ, because it needs to safely patch/unpatch on a shared model object
 
 ### `shared_fast_extra_vram`
-- Faster swapping than safe mode (uses inplace updates / device-friendly behavior)
-- Still shares one model object, so there’s still unavoidable overhead
-- Uses extra VRAM
+
+- Optimizes shared-model swapping (may use more VRAM and device-friendly behavior)
+- Still shares one model object, so there is still inherent swap overhead
 
 ### `dual_models_2x_vram`
-- Fastest **when you truly load two separate checkpoint instances** (see the “second checkpoint path” section above)
-- Uses ~2× checkpoint VRAM
-- Avoids the expensive shared swapping path entirely
+
+- Requires two truly separate model instances (see section above)
+- Avoids shared swapping overhead entirely
+- Uses ~2× checkpoint VRAM (plus LoRAs + activations)
 
 ---
 
-## AutoGuidance delta mode (`ag_delta_mode`)
+## AutoGuidance delta modes (`ag_delta_mode`)
 
-### `bad_conditional` (recommended default)
-Uses the most “LoRA-sensitive” direction in practice:
-- compare **good conditional output** vs **bad conditional output**
+All modes ultimately build a direction `d_ag_dir` and add:
 
-This tends to show the biggest differences when you change LoRAs on the bad path.
+`denoised = cfg_out + w * d_ag_dir` (optionally capped/ramped)
+
+### `bad_conditional`
+
+Uses a conditional-only push-away-from-bad direction:
+
+- `d_ag_dir = (cond_good - cond_bad)`
+
+This is the most direct “good conditional vs bad conditional” comparison.
 
 ### `raw_delta`
-Uses a raw difference direction between guided outputs. Can be harsher / less predictable.
+
+Uses the difference between the *guided outputs* of good vs bad (i.e. after CFG pipeline):
+
+- `d_ag_dir = (cfg_out_good - cfg_out_bad)`
+
+This can behave differently depending on what CFG functions/hooks your workflow uses.
 
 ### `project_cfg`
-Projects the “push-away-from-bad” direction onto the **actual CFG update direction**.
-This keeps changes more aligned with CFG, often more conservative.
+
+Projects the conditional push-away-from-bad direction onto the **actual applied CFG update direction** (not just `cond-uncond`):
+
+- compute `cfg_update_dir = (cfg_out - uncond_good)`
+- project `(cond_good - cond_bad)` onto `cfg_update_dir`
+
+This keeps AutoGuidance aligned with the direction CFG is actually applying.
 
 ### `reject_cfg`
-Removes the component of the “push-away-from-bad” direction that is parallel to the **actual CFG update direction**.
-This can increase composition changes when AG otherwise behaves like “CFG++”.
+
+Removes the component of the conditional push-away-from-bad direction that is parallel to the **actual applied CFG update direction**:
+
+- `d_ag_dir = d_ag_cond - proj_{cfg_update_dir}(d_ag_cond)`
+
+This is intended to avoid AutoGuidance degenerating into “CFG++” behavior in cases where the delta is mostly parallel to CFG.
 
 ---
 
-## Safety cap: `ag_max_ratio`
+## Safety cap (`ag_max_ratio`)
 
-AutoGuidance is capped relative to the magnitude of the **actual CFG update** (`cfg_out - uncond_good`):
+The node can cap the AutoGuidance delta magnitude relative to the magnitude of the **actual applied CFG update**:
 
-- Higher `ag_max_ratio` = stronger visible effect (up to destabilization if extreme)
-- Lower `ag_max_ratio` = subtler
+- `cfg_update = cfg_out - uncond_good`
+- cap compares `||ag_delta||` against `ag_max_ratio * ||cfg_update||`
 
-A good starting range:
-- SDXL: `0.35` to `0.80`
+What this means:
+- If `ag_max_ratio` is small, you may see very little effect even if good/bad differ.
+- If `ag_max_ratio` is large, the delta can dominate and destabilize the result.
 
-If your output looks “basically like normal CFG”, this cap (and/or the ramp) is the first place to look.
+This repo includes debug metrics to show whether the cap is biting (see Debug section). Don’t guess—look at:
+- `n_cfg`, `n_delta`, `n_delta_applied`, `scale`
 
 ---
 
-## Ramp over steps (this controls “composition vs detail”)
+## Ramp over steps (cap modulation)
 
-These parameters scale **the cap** (`ag_max_ratio`) over denoise progress.
+Ramp settings scale **the cap** over denoise steps. This controls *when* in the schedule AutoGuidance is allowed to be strong.
 
-Important concept:
-- Progress is defined as **0 early (high sigma)** → **1 late (low sigma)**
+Progress is defined as:
+- `prog = step / (total_steps - 1)`
+- `prog = 0` at the first step, `prog = 1` at the last step
 
 ### `ag_ramp_mode`
-- `flat`  
-  Constant cap across all steps.  
-  **Use this if you want composition changes.**
-- `detail_late`  
-  Weak early, strong late → mostly affects fine detail.  
-  If `ag_ramp_floor = 0`, early steps can get near-zero AG and the image composition will stay very close to normal CFG.
-- `compose_early`  
-  Strong early, weaker late → pushes structure/composition more than detail.
-- `mid_peak`  
-  Strongest mid-steps, weaker at ends.
+
+- `flat`: constant cap over steps
+- `detail_late`: weak early, stronger late
+- `compose_early`: strong early, weaker late
+- `mid_peak`: strongest mid-steps, weaker at ends
 
 ### `ag_ramp_power`
-Controls steepness (shape). Higher = more extreme.
+
+Controls steepness of the selected ramp curve.
 
 ### `ag_ramp_floor`
-Minimum always-on fraction of the cap.
-- `0.0` means the ramp can reduce AG close to zero at some parts of the schedule.
-- If you use `detail_late` but still want *some* early influence, set `ag_ramp_floor` to something like `0.10–0.30`.
 
-### Practical presets
+A floor on the ramp factor (fraction of the cap that is always active).  
+This prevents ramps like `detail_late` from effectively disabling early steps.
 
-**If you want bigger composition changes (more like NAG-style behavior):**
-- `ag_ramp_mode = flat` OR `compose_early`
-- `ag_ramp_floor = 0.10–0.30` (optional but helpful)
-- Raise `ag_max_ratio` before raising `w_autoguide` to absurd values
-
-**If you mainly want detail/texture improvements while keeping composition stable:**
-- `ag_ramp_mode = detail_late`
-- `ag_ramp_floor = 0.0–0.15`
-- `ag_ramp_power = 2.0–4.0`
+> No numeric “presets” here on purpose: the right values depend on your sampler, schedule, CFG pipeline, and any post-CFG hooks. Use the debug metrics to verify what’s actually being applied.
 
 ---
 
-## Advanced / safety toggles
+## Advanced toggles
 
 ### `safe_force_clean_swap`
-Only relevant in shared-model modes. Forces clean swaps between patch stacks to avoid state leakage / washed-out results on some Comfy builds.
-- Safer
+
+Shared-model modes only. Forces conservative clean swaps between patch stacks.
+- More likely to avoid state leakage across wrapper stacks
 - Slower
 
 ### `uuid_only_noop`
-Debug option. Treat “same patches_uuid” as a no-op even if ownership tracking is imperfect.
-Use only for debugging.
+
+Debug-only. Treat “same patches_uuid” as a no-op even if ownership tracking is imperfect. This can hide bugs, so only use it when debugging.
+
+---
+
+## Debugging and verification
 
 ### `debug_swap`
-Prints swap/patch diagnostics (patch counts, uuids, etc.)
+
+Prints information about patch stacks and swapping, including:
+- patch UUIDs
+- patch counts
+- (optional) layer digests to confirm models/patchers actually differ
+
+This answers: **“Are my good/bad stacks actually different?”**
 
 ### `debug_metrics`
-Prints direction / magnitude diagnostics (useful for confirming AG is actually being applied).
-It also logs active `sampler_post_cfg_function` hooks at step 0, which helps diagnose post-CFG rescale/clamp behavior that can suppress visible AG effects.
+
+Prints numerical diagnostics for the AutoGuidance delta and cap, including (per selected steps):
+- `n_cfg` (magnitude of actual applied CFG update)
+- `n_delta` (magnitude of raw AG delta before cap)
+- `n_delta_applied` (magnitude after cap)
+- `scale` (how hard you’re being clamped)
+- `n_good_minus_bad_cond` (how different good/bad conditional predictions are)
+
+It also prints the active `sampler_post_cfg_function` hooks at step 0, which helps diagnose workflows where post-CFG logic rescale/clamps the result and can suppress visible differences.
+
+This answers: **“Is AG being applied, and is it being clamped?”**
 
 ---
 
 ## Troubleshooting
 
-### “It looks almost the same as normal CFG”
-Common causes:
-1) **Your ramp/cap is effectively zero early**, so composition won’t move.
-   - If you used `detail_late` with `ag_ramp_floor = 0`, early AG can be near-zero by design.
-   - Fix: use `flat` or `compose_early`, or raise `ag_ramp_floor`.
+### “It looks the same as normal CFG”
 
-2) **Bad model is not actually “bad enough”**
-   - Make bad_model deliberately wrong for one test (strong wrong LoRA, remove key LoRA, etc.)
+Don’t guess—check logs:
 
-3) **You’re not truly in dual-model mode**
-   - If you selected `dual_models_2x_vram` but did not load the checkpoint via two different file paths, you’re not actually dual-model and performance/behavior will be off.
+1) **Is AG actually applied?**
+- Ensure `w_autoguide > 1.0`
+- Ensure `ag_max_ratio > 0.0`
+- Look at `debug_metrics`:
+  - if `n_delta_applied` is ~0 or `scale` is ~0, you’re effectively clamped to nothing
+  - if `n_good_minus_bad_cond` is very small, your bad path isn’t meaningfully different
 
-### “dual_models_2x_vram is insanely slow”
-That happens when both loaders resolve to the same underlying model instance (same checkpoint path / caching). Fix it by creating a second checkpoint file path and loading both.
+2) **Are good/bad models actually different in the run you think they are?**
+- Look at `patch_info`:
+  - if bad shows `count: 0` but you expected LoRAs, your bad stack isn’t applied
+- In dual mode, check the printed digests:
+  - if digests barely change even when you expect them to, your “bad” setup isn’t actually changing weights the way you think
 
-### “My LoRA changes on the bad path do nothing”
-Check `debug_swap` / `patch_info`:
-- If patch counts change when you edit bad LoRAs, the patches are applied.
-- If the image still doesn’t move, your ramp/cap likely prevents early-step influence (composition stays locked).
+3) **Are post-CFG hooks suppressing the effect?**
+- `debug_metrics` prints `post_cfg_functions` at step 0.
+- Some workflows clamp/rescale after CFG. If those hooks strongly normalize the output, visible deltas can shrink.
+- For diagnosis, temporarily remove/disable post-CFG hooks in your graph and compare.
+
+### “`dual_models_2x_vram` is slow / behaves like shared”
+
+- Most commonly: both loaders resolved to the same underlying model instance.
+- Fix: load from two distinct checkpoint paths (copy file).
+
+### “Changing LoRAs on bad path does nothing”
+
+- Look at `patch_info`:
+  - If the bad patch count doesn’t change when you change bad LoRAs, the patches are not applied to the bad path.
+- If patches change but output doesn’t:
+  - inspect `scale` and `n_delta_applied`
+  - inspect post-CFG hooks
 
 ---
 
 ## Credits
 
-- Paper: **Guiding a Diffusion Model with a Bad Version of Itself** (Karras et al.). :contentReference[oaicite:2]{index=2}
-- This repository implements an AutoGuidance-style guider node for ComfyUI’s custom sampler pipeline.
-
----
+- Paper: https://arxiv.org/abs/2406.02507  
+- This repository implements an AutoGuidance-style guider node compatible with ComfyUI’s custom sampler pipeline.
