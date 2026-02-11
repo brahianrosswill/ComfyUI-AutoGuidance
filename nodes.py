@@ -90,11 +90,13 @@ AG_SWAP_MODE_CHOICES = [
 AG_DELTA_MODE_RAW = "raw_delta"
 AG_DELTA_MODE_PROJECT_CFG = "project_cfg"
 AG_DELTA_MODE_BAD_CONDITIONAL = "bad_conditional"
+AG_DELTA_MODE_REJECT_CFG = "reject_cfg"
 
 AG_DELTA_MODE_CHOICES = [
     AG_DELTA_MODE_BAD_CONDITIONAL,
     AG_DELTA_MODE_RAW,
     AG_DELTA_MODE_PROJECT_CFG,
+    AG_DELTA_MODE_REJECT_CFG,
 ]
 
 AG_RAMP_FLAT = "flat"
@@ -109,7 +111,7 @@ AG_RAMP_MODE_CHOICES = [
     AG_RAMP_MID_PEAK,
 ]
 
-# Default cap for AG magnitude relative to CFG-direction magnitude.
+# Default cap for AG magnitude relative to the actually applied CFG update magnitude.
 # Old code used 0.10 which is often visually near-invisible.
 AG_DEFAULT_MAX_RATIO = 0.35
 
@@ -1232,6 +1234,13 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             bad_uncond_pred = out_bad[1]
 
             dbg = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
+            if dbg and step == 0 and not hasattr(self, "_ag_dbg_post_cfg_once"):
+                try:
+                    fns = model_options.get("sampler_post_cfg_function", []) or []
+                    print("[AutoGuidance] post_cfg_functions", [getattr(fn, "__name__", type(fn).__name__) for fn in fns])
+                except Exception as e:
+                    print("[AutoGuidance] post_cfg_functions failed", repr(e))
+                self._ag_dbg_post_cfg_once = True
             bad_sig_key = f"_ag_dbg_badcond_sig_once_{getattr(self.bad_model_patcher, 'patches_uuid', None)}"
             if dbg and not hasattr(self, bad_sig_key):
                 try:
@@ -1268,11 +1277,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             self.inner_model.current_patcher = self.model_patcher
 
             d_cfg = cond_pred_good - uncond_pred_good
-            # Two useful deltas:
-            # - d_ag_cfg: delta vs bad model run with the same CFG pipeline
-            # - d_ag_ref: delta vs bad model conditional-only (paper-style "bad" reference)
+            cfg_update_dir = cfg_out - uncond_pred_good  # actual applied CFG update direction
+            # Two useful AG deltas:
+            # - d_ag_cond: conditional good-vs-bad direction (paper-style push-away-from-bad)
+            # - d_ag_cfg:  CFG output good-vs-bad direction (optional/raw mode)
+            d_ag_cond = cond_pred_good - bad_cond_pred
             d_ag_cfg = cfg_out - bad_cfg_out
-            d_ag_ref = cfg_out - bad_cond_pred
             w = max(float(self.w_ag - 1.0), 0.0)
             if w <= 0.0:
                 denoised = cfg_out
@@ -1282,25 +1292,32 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
                 # Choose AG direction.
                 if mode == AG_DELTA_MODE_PROJECT_CFG:
-                    cfg_denom = (d_cfg.float() * d_cfg.float()).sum() + 1e-8
-                    # Project the "push away from bad" direction onto the CFG direction.
-                    alpha = (d_ag_ref.float() * d_cfg.float()).sum() / cfg_denom
+                    cfg_denom = (cfg_update_dir.float() * cfg_update_dir.float()).sum() + 1e-8
+                    # Project the conditional push-away-from-bad direction onto the actual CFG update direction.
+                    alpha = (d_ag_cond.float() * cfg_update_dir.float()).sum() / cfg_denom
                     if not allow_neg:
                         alpha = torch.clamp(alpha, min=0.0)
-                    d_ag_dir = d_cfg * alpha.to(d_cfg.dtype)
+                    d_ag_dir = cfg_update_dir * alpha.to(cfg_update_dir.dtype)
+                elif mode == AG_DELTA_MODE_REJECT_CFG:
+                    # Remove CFG-parallel component (w.r.t. actual CFG update) so AG can drive non-CFG structure changes.
+                    cfg_denom = (cfg_update_dir.float() * cfg_update_dir.float()).sum() + 1e-8
+                    alpha = (d_ag_cond.float() * cfg_update_dir.float()).sum() / cfg_denom
+                    if not allow_neg:
+                        alpha = torch.clamp(alpha, min=0.0)
+                    d_ag_dir = d_ag_cond - cfg_update_dir * alpha.to(cfg_update_dir.dtype)
                 elif mode == AG_DELTA_MODE_RAW:
                     # Delta between good- and bad-guided outputs.
                     d_ag_dir = d_ag_cfg
                 else:
-                    # Strongest + most LoRA-sensitive: compare good CFG output to bad conditional-only output.
-                    d_ag_dir = d_ag_ref
+                    # Default: conditional good-vs-bad direction.
+                    d_ag_dir = d_ag_cond
 
                 ag_delta = w * d_ag_dir
 
-                # Cap magnitude relative to CFG-direction magnitude.
+                # Cap magnitude relative to the actual applied CFG update.
                 max_ratio = float(getattr(self, "ag_max_ratio", AG_DEFAULT_MAX_RATIO))
                 if max_ratio > 0.0:
-                    n_cfg = d_cfg.float().pow(2).sum().sqrt() + 1e-8
+                    n_cfg = cfg_update_dir.float().pow(2).sum().sqrt() + 1e-8
                     n_delta = ag_delta.float().pow(2).sum().sqrt() + 1e-8
                     ratio = max_ratio
                     sigma_max = getattr(self, "_ag_sigma_max", None)
@@ -1327,12 +1344,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
                     if debug_metrics and not hasattr(self, "_ag_dbg_dir_once"):
                         d1 = d_ag_dir.detach().float()
-                        d2 = d_cfg.detach().float()
+                        d2 = cfg_update_dir.detach().float()
                         n1 = d1.pow(2).sum().sqrt() + 1e-8
                         n2 = d2.pow(2).sum().sqrt() + 1e-8
                         cos = float((d1 * d2).sum().cpu() / (n1 * n2))
                         sig = float(d1.flatten()[:8192].sum().cpu())
-                        print("[AutoGuidance] dir", {"cos_ag_vs_cfg": cos, "ag_dir_sig": sig})
+                        print("[AutoGuidance] dir", {"cos_ag_vs_cfg_update": cos, "ag_dir_sig": sig})
                         self._ag_dbg_dir_once = True
 
                     if debug_metrics and (step == 0 or last):
@@ -1347,6 +1364,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                                 "mode": mode,
                                 "w_ag": float(self.w_ag),
                                 "w": float(w),
+                                "cfg": float(self.cfg),
                                 "ag_max_ratio": float(max_ratio),
                                 "ag_ramp_mode": str(getattr(self, "ag_ramp_mode", AG_RAMP_FLAT)),
                                 "ag_ramp_power": float(getattr(self, "ag_ramp_power", 2.0)),
