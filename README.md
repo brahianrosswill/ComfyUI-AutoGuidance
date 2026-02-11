@@ -1,23 +1,13 @@
 # ComfyUI-AutoGuidance
 
-Adds an **AutoGuidance + CFG** **GUIDER** node for ComfyUI.
+Adds an **AutoGuidance + CFG** **GUIDER** node for **ComfyUI**, based on the AutoGuidance paper: **“AutoGuidance: Automatic Guidance for Diffusion Models”**  - `https://arxiv.org/abs/2406.02507`
 
-AutoGuidance steers the sampler by comparing a “good” model path vs a “bad” model path and injecting an extra guidance term (in addition to normal CFG). This implementation is based on the paper:
+This node lets you guide sampling using **two models**:
 
-- `https://arxiv.org/abs/2406.02507`
+- **good_model**: your normal model path (checkpoint + your “good” LoRAs, prompt, etc.)
+- **bad_model**: an intentionally different path (often “baseline” / “undesired” / “early-bad” LoRA stack)
 
----
-
-## What this node does (high-level)
-
-Each sampling step, the guider runs:
-
-- **Good path**: your normal CFG inference (positive + negative) using `good_model`
-- **Bad path**: an auxiliary inference using `bad_model` (typically “positive only” reference)
-
-Then it forms an **AutoGuidance delta** from the difference between good vs bad predictions (mode-dependent) and adds it to the normal CFG result, with safety limits so it doesn’t explode.
-
-**Why**: you can use a “bad” reference (different LoRAs, different style bias, early draft LoRA, etc.) and push away from it while still following the prompt.
+At each denoise step, the guider computes the usual **CFG** output from the **good** model and then applies an **AutoGuidance delta** derived from the difference between **good** and **bad** predictions.
 
 ---
 
@@ -31,233 +21,203 @@ Restart ComfyUI.
 
 ---
 
-## Quick start workflow
+## Node
 
-1) Load two models (or one model twice, depending on swap mode)
-2) Create guider with **AutoGuidance CFG Guider (good+bad)**
-3) Feed the guider into **SamplerCustomAdvanced**
-
-Typical setup:
-- `good_model`: your normal checkpoint + “good” LoRAs
-- `bad_model`: same checkpoint but with “bad” LoRAs (or none), or a deliberately different LoRA stack
+**AutoGuidance CFG Guider (good+bad)**  
+Category: `sampling/guiders`  
+Output: `GUIDER` (plug into `SamplerCustomAdvanced`)
 
 ---
 
-## Swap modes (speed + VRAM + correctness)
+## Quick start
 
-### `dual_models_2x_vram` (FASTEST, but needs 2 real model instances)
-This mode is intended to run good+bad as two separate model instances so sampling speed is close to normal CFG.
+### 1) Build your good and bad models
 
-**CRITICAL: you must force ComfyUI to load the checkpoint twice as two distinct instances.**
-ComfyUI will otherwise **deduplicate** and reuse the same underlying model object when the checkpoint path resolves to the same file.
+Typical graph layout:
 
-If you do not force two instances, `dual_models_2x_vram` will **definitely behave like a shared-model setup internally**, and performance can become **dramatically worse** (often *much* slower than normal CFG).
+- `CheckpointLoaderSimple` → **good_model**
+- `CheckpointLoaderSimple` → **bad_model**
+- Apply LoRAs on each path however you want:
+  - good path: character/style/LCM/etc.
+  - bad path: “bad” LoRA stack (or a different style, different character LoRA, or *no* LoRAs)
 
-✅ Correct way:
-- Make a physical copy of the checkpoint (different filename/path) and load each one separately:
+Then:
 
-  - good_model loads: `MyCheckpoint.safetensors`
-  - bad_model loads:  `MyCheckpoint_COPY.safetensors`
+- `CLIPTextEncode` positive/negative → `AutoGuidance CFG Guider (good+bad)`
+- `AutoGuidance CFG Guider (good+bad)` → `SamplerCustomAdvanced`
 
-(Using symlinks may still dedupe depending on how the path resolves; a real copy is the safest.)
+### 2) Turn it off / on
 
-VRAM cost: ~2× the checkpoint VRAM footprint (plus LoRAs).
-
----
-
-### `shared_safe_low_vram` (MOST COMPATIBLE, can be VERY slow)
-Good and bad share the same underlying model instance, and the node swaps patch state (LoRAs/object patches) between them.
-
-This mode is correctness-first, but it can be **much slower than standard CFG** — in worst cases **orders of magnitude slower** — because it does:
-- multiple UNet passes per step (good + bad), **and**
-- patch/unpatch work to swap LoRA stacks.
-
-Use this only when you cannot afford 2× VRAM or you need maximum compatibility.
+- **AG off**: `w_autoguide = 1.0`
+- Start here: `w_autoguide = 2.0`, `ag_max_ratio = 0.35`
+- Stronger: `w_autoguide = 3.0–5.0`, `ag_max_ratio = 0.6–1.0`
 
 ---
 
-### `shared_fast_extra_vram` (shared swapping, less overhead, still can be slow)
-Still shared-model swapping, but uses more aggressive patcher settings and keeps more on-device state to reduce overhead.
+## Swap modes (this matters a lot)
 
-This can be faster than `shared_safe_low_vram`, but it is still a shared swapping strategy and can still be significantly slower than standard CFG depending on your LoRA stack and Comfy internals.
+### `dual_models_2x_vram` (recommended for speed)
+- Requires **two truly separate model instances** (≈ **2× VRAM** for the checkpoint).
+- **You MUST load the checkpoint twice from two different file paths** so ComfyUI does not reuse the same underlying model object.
 
-If you see any output corruption, revert to `shared_safe_low_vram`.
+**Do this:**
+- Copy your checkpoint file:
+  - `SDXL.safetensors` → `SDXL_copy.safetensors`
+- Load `SDXL.safetensors` for **good_model**
+- Load `SDXL_copy.safetensors` for **bad_model**
 
----
+**Do NOT do this:**
+- Loading the *same* checkpoint path for both inputs.
+  - If you do, ComfyUI will reuse the same base model object.
+  - That means **dual mode will not actually be dual** internally.
+  - You will effectively be running a shared-model swap path instead.
+  - This is not “maybe”; it is how the underlying object reuse works.
 
-## Node inputs
-
-### Required
-- **good_model (MODEL)**: The model used for normal CFG.
-- **bad_model (MODEL)**: The model used as AutoGuidance reference.
-- **positive (CONDITIONING)**: Your prompt conditioning.
-- **negative (CONDITIONING)**: Your negative prompt conditioning.
-- **cfg (FLOAT)**: Standard CFG scale.
-- **w_autoguide (FLOAT)**: Paper-style AutoGuidance strength:
-  - `1.0` = off (behaves like normal CFG)
-  - `2.0` = moderate
-  - `3.0+` = strong
-
-- **swap_mode**: One of:
-  - `shared_safe_low_vram`
-  - `shared_fast_extra_vram`
-  - `dual_models_2x_vram`
+**Why you care:**  
+Dual mode removes the expensive “swap LoRA stacks on the same model repeatedly” overhead. If you don’t truly have two model instances, performance can get **orders of magnitude worse** in some setups (people have seen ~**20×** slowdowns).
 
 ---
 
-## Optional settings (what they do + how to use them)
+### `shared_safe_low_vram`
+- One model instance, swaps patch state between good/bad on the same object.
+- Lowest VRAM.
+- **Can be extremely slow** depending on your ComfyUI build + LoRA stack + hook stack, because it repeatedly unpatches/patches weights.
 
-### 1) `ag_delta_mode`
-Controls *which* difference vector is used for the AutoGuidance direction.
-
-- **`bad_conditional` (recommended default)**  
-  Uses the difference between **good CFG output** and **bad conditional-only** prediction.  
-  Usually the most sensitive to LoRA differences and the most “noticeable”.
-
-- **`raw_delta`**  
-  Uses the difference between the fully guided outputs of good vs bad.
-
-- **`project_cfg`**  
-  Projects the AutoGuidance direction onto the CFG direction.  
-  This is more conservative and can look closer to standard CFG.
-
-**If your results look too similar to normal CFG**, try:
-- `bad_conditional`
-- higher `ag_max_ratio`
-- and a ramp mode that emphasizes earlier steps (see below)
+### `shared_fast_extra_vram`
+- One model instance, but keeps more things resident to reduce swap overhead.
+- Uses extra VRAM to reduce the cost of swapping.
+- Still fundamentally a shared-model swap approach.
 
 ---
 
-### 2) `ag_max_ratio` (how strong AG is allowed to get)
-AutoGuidance delta is capped relative to the magnitude of the CFG direction:
+## AutoGuidance settings explained
 
-- Higher = more effect (but can destabilize)
-- Lower = subtle
+### `w_autoguide`
+Paper-style control:
+- `1.0` = off
+- `2.0` = moderate
+- `3.0–5.0` = strong
 
-Practical ranges:
-- `0.35` subtle
-- `0.6–1.0` noticeable
-- `1.0–2.0` very strong / can get unstable depending on model/LoRAs
+Internally the node turns this into the scale used to add the AG delta on top of CFG.
 
-If you set this too high without a ramp/floor strategy, you can get “wrong VAE / collapse-ish” artifacts.
+### `ag_delta_mode`
+How the AG direction is computed:
 
----
+- **`bad_conditional` (default, most sensitive to LoRA differences)**  
+  Compares *good CFG output* vs *bad conditional-only* output.
 
-### 3) Ramp settings (how the cap changes across denoise progress)
+- `raw_delta`  
+  Uses the delta between the full good-guided output and full bad-guided output.
 
-These settings scale the *effective* `ag_max_ratio` over the sampling trajectory.
+- `project_cfg`  
+  Projects the “push-away-from-bad” direction onto the CFG direction (more conservative).
+  - `ag_allow_negative` controls whether the projection can flip direction.
 
-- **`ag_ramp_mode`**
-  - `flat`: constant cap across steps (best default; avoids “AG=0 early” surprises)
-  - `detail_late`: stronger late steps (detail refinement emphasis)
-  - `compose_early`: stronger early steps (composition/layout emphasis)
-  - `mid_peak`: strongest in the middle (often a balanced compromise)
+### `ag_max_ratio`
+Caps AG magnitude relative to CFG magnitude:
+- If AG looks too subtle: **increase this first** (e.g. `0.35 → 0.75`).
+- If AG breaks structure / looks “wrong VAE-ish”: lower it.
 
-- **`ag_ramp_power`**
-  Controls how sharply the ramp changes:
-  - `1.0` = gentle
-  - `2.0` = stronger curve
-  - `4.0+` = very concentrated
+### Ramp controls (AG strength over the denoise timeline)
 
-- **`ag_ramp_floor`**
-  Minimum always-on fraction of `ag_max_ratio` (0..1).  
-  Use this to prevent “near-zero AG” regions.
-  - Example: `0.10` means “at least 10% of the cap is always available”
+These shape **how much of `ag_max_ratio` is allowed** early vs late.
 
-#### Suggested presets
-**A) Composition / pose changes (more NAG-like behavior)**
-- `ag_ramp_mode = compose_early`
-- `ag_ramp_floor = 0.10–0.25`
-- `ag_max_ratio = 0.8–1.5`
-- `w_autoguide = 3.0–5.0`
+- `ag_ramp_mode`:
+  - `flat` (recommended default): constant cap across steps
+  - `detail_late`: weaker early, stronger late (detail emphasis)
+  - `compose_early`: stronger early, weaker late (composition emphasis)
+  - `mid_peak`: strongest mid-steps (often a good “balanced” feel)
 
-**B) Detail-only refinement (minimal composition drift)**
-- `ag_ramp_mode = detail_late`
-- `ag_ramp_floor = 0.05–0.15`
-- `ag_max_ratio = 0.5–1.0`
-- `w_autoguide = 2.0–3.5`
+- `ag_ramp_power`:
+  - Shapes the curve (higher = more extreme curve)
 
-**C) Conservative / close to CFG**
-- `ag_delta_mode = project_cfg`
-- `ag_ramp_mode = flat`
-- `ag_max_ratio = 0.3–0.6`
-- `w_autoguide = 1.5–2.5`
+- `ag_ramp_floor`:
+  - Minimum always-on fraction of the cap (0..1)
+  - **Important for low-step samplers (LCM, 6–10 steps):**
+    - If you use `detail_late` with `ag_ramp_floor = 0`, AG can be near-zero for most of the run.
+    - If you want visible changes with LCM, use:
+      - `flat`, **or**
+      - `detail_late` + `ag_ramp_floor = 0.1–0.3`, **or**
+      - `compose_early`
 
----
-
-### 4) `ag_allow_negative` (mainly for `project_cfg`)
-If `False`, AutoGuidance components that point “opposite” to the projected CFG direction are clamped away.
-
-- `True` (default): allows signed projection
-- `False`: more conservative
+**Practical rule:**  
+- Want **composition/body pose** to change more → use `compose_early` (and/or raise `ag_max_ratio`)  
+- Want **micro-detail** changes → use `detail_late`  
+- Want consistent influence → use `flat`
 
 ---
 
-### 5) Swap/ownership safety knobs
+## Swap / safety / debug options
 
-- **`safe_force_clean_swap`**
-  Forces a “clean” unpatch/patch cycle during shared swapping.
-  - Slower
-  - Fixes “washed out”, “same output”, or other swap-state leakage on some Comfy builds
+### `safe_force_clean_swap`
+For shared modes: forces a “clean” swap to avoid state leak across patch stacks.
+- Safer correctness-wise
+- Slower
 
-- **`uuid_only_noop`**
-  Debug/edge-case setting. Treat “same patch UUID” as a no-op without extra validation.
-  - Can hide broken swapping; leave `False` unless debugging.
+### `uuid_only_noop`
+Debug option: treats “same UUID” as no-op without extra validation.
+- Useful while diagnosing swap behavior
+- Can hide broken swaps if misused
 
----
-
-### 6) Debug settings
-
-- **`debug_swap`**
-  Prints patch/ownership info and signatures to help confirm swaps are actually happening.
-
-- **`debug_metrics`**
-  Prints magnitude diagnostics (CFG magnitude, AG magnitude, cap ratio, etc.).  
-  Very useful to detect cases where AG is effectively being clamped to ~0.
+### `debug_swap`, `debug_metrics`
+Prints debug lines:
+- patch counts and sample keys (helps confirm LoRAs are actually present on each path)
+- AG magnitude metrics (helps confirm AG isn’t being capped to ~0)
 
 ---
 
-## Troubleshooting
+## What to expect (so you don’t chase ghosts)
 
-### “Looks almost the same as normal CFG”
-Most common reasons:
-1) **AG is getting clamped** (effective ratio near 0, or `scale` near 0).  
-   Fix: increase `ag_max_ratio`, use `flat` ramp or raise `ag_ramp_floor`.
+### “It looks almost like normal CFG”
+Common causes:
 
-2) **Good vs bad are not meaningfully different (in early steps)**  
-   Fix: make bad model *actually different* (remove a key LoRA, use a deliberately “bad” LoRA, etc.), and/or use `compose_early`.
+1) **AG is being capped to ~0**
+- Your debug line will show something like:
+  - `ratio_eff: 0.0`, `limit: 0.0`, `scale: 0.0`
+- Fix:
+  - Use `ag_ramp_mode = flat`, or raise `ag_ramp_floor`, or use `compose_early`
 
-3) **Using `detail_late` with `ag_ramp_floor=0.0`**  
-   That intentionally gives near-zero effect early (composition won’t change much).
+2) **Your “bad” path isn’t meaningfully different**
+- Fix:
+  - Make the bad path actually different (different LoRA stack, different checkpoint, different style LoRA, etc.)
 
-### “dual_models_2x_vram is not faster”
-Ensure you truly loaded two distinct model instances:
-- Copy the checkpoint file and load the copy for the other branch.
-If both branches reference the same underlying file/path, Comfy may reuse the instance.
+3) **You’re using very few steps (LCM) + a “late” ramp**
+- With 6–10 steps, “late” is a tiny part of the run.
+- Fix:
+  - `flat` or `compose_early`, or set `ag_ramp_floor`
 
-### “washed out / corrupted / wrong VAE-looking collapse”
-- Reduce `ag_max_ratio`
-- Reduce `w_autoguide`
-- Use `shared_safe_low_vram`
-- Use `flat` ramp + a small `ag_ramp_floor`
-- If it only happens with shared swapping, enable `safe_force_clean_swap`
+### “Changing LoRAs on the bad path does nothing”
+Use `debug_swap` and look at `patch_info`:
+- If bad patch count / keys change when you change LoRAs, the bad path is receiving them.
+- If they never change, you’re not actually feeding the modified model into the guider.
 
 ---
 
-## Recommended baseline settings (starting point)
+## Recommended presets
 
-If you just want “it works”:
+### LCM / very low steps (e.g. 6–10)
 - `ag_delta_mode = bad_conditional`
-- `w_autoguide = 2.0–3.0`
-- `ag_max_ratio = 0.6–1.0`
-- `ag_ramp_mode = flat`
-- `ag_ramp_floor = 0.10`
-- `swap_mode = dual_models_2x_vram` (with checkpoint copy) if VRAM allows
+- `ag_ramp_mode = flat` (or `compose_early`)
+- `ag_max_ratio = 0.5–1.0`
+- `w_autoguide = 2.0–4.0`
+
+### “More composition change”
+- `ag_ramp_mode = compose_early`
+- raise `ag_max_ratio`
+- raise `w_autoguide`
+
+### “Mostly detail change”
+- `ag_ramp_mode = detail_late`
+- set `ag_ramp_floor = 0.1–0.3` (especially for low-step samplers)
 
 ---
 
-## Use
+## License
 
-- Build `good_model` and `bad_model` (e.g. SDXL + good LoRA, SDXL + early/bad LoRA)
-- Create GUIDER with `AutoGuidance CFG Guider (good+bad)`
-- Feed GUIDER into `SamplerCustomAdvanced`
+MIT (see `LICENSE.txt`). Note: the included MIT template may still contain placeholders; update it if you intend to publish under your name.
+
+---
+
+## Credits / Reference
+
+AutoGuidance paper: 
