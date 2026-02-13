@@ -88,6 +88,10 @@ If both loaders point to the exact same path, ComfyUI may share/collapse model s
 
 ### Optional core controls
 
+- `ag_combine_mode`
+  - `sequential_delta` (default; current behavior: CFG result + AG delta)
+  - `multi_guidance_paper` (paper-style multi-guide extrapolation using good-cond, good-uncond, bad-cond)
+  - In `multi_guidance_paper`, `ag_delta_mode`, `ag_max_ratio`, ramping, and project/reject controls are not used.
 - `ag_delta_mode`
   - `bad_conditional` (default, common starting point)
   - `raw_delta`
@@ -149,6 +153,16 @@ Core idea: bad side should be meaningfully weaker/less specialized than good sid
 ## Practical tuning notes
 
 - Increase `w_autoguide` above `1.0` to strengthen effect.
+- In `multi_guidance_paper` mode, weights are interpreted as:
+  - `w_cfg = max(cfg - 1, 0)`
+  - `w_ag = max(w_autoguide - 1, 0)`
+  - output = `(1 + w_cfg + w_ag) * C - w_cfg * U - w_ag * B`
+    where `C` = good conditional, `U` = good negative/uncond, `B` = bad conditional.
+- To reproduce fixed-total-guidance interpolation from the paper (`g`, mix `α`):
+  - `cfg = 1 + (g - 1)(1 - α)`
+  - `w_autoguide = 1 + (g - 1)α`
+  - `ag_combine_mode = multi_guidance_paper`
+- In `multi_guidance_paper`, `ag_post_cfg_mode` only controls whether post-CFG hooks run (`skip`); there is no separate AG "apply after" stage.
 - Use `ag_max_ratio` to prevent runaway/cooked outputs.
 - `compose_early` tends to affect composition/structure earlier in denoise.
 - Try `detail_late` for a more late-step/detail-leaning influence.

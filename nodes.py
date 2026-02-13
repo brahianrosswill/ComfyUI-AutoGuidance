@@ -5,7 +5,7 @@ import inspect
 import os
 from collections import Counter
 from collections.abc import Mapping
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import comfy.sampler_helpers
@@ -137,6 +137,14 @@ AG_POST_CFG_MODE_CHOICES = [
     AG_POST_CFG_KEEP,
     AG_POST_CFG_APPLY_AFTER,
     AG_POST_CFG_SKIP,
+]
+
+AG_COMBINE_MODE_SEQUENTIAL_DELTA = "sequential_delta"
+AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER = "multi_guidance_paper"
+
+AG_COMBINE_MODE_CHOICES = [
+    AG_COMBINE_MODE_SEQUENTIAL_DELTA,
+    AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER,
 ]
 
 AG_RAMP_FLAT = "flat"
@@ -875,6 +883,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         ag_ramp_power: float = 2.0,
         ag_ramp_floor: float = 0.0,
         ag_post_cfg_mode: str = AG_POST_CFG_KEEP,
+        ag_combine_mode: str = AG_COMBINE_MODE_SEQUENTIAL_DELTA,
         safe_force_clean_swap: bool = True,
         uuid_only_noop: bool = False,
         debug_swap: bool = False,
@@ -893,6 +902,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         self.ag_ramp_power: float = float(ag_ramp_power)
         self.ag_ramp_floor: float = float(ag_ramp_floor)
         self.ag_post_cfg_mode: str = str(ag_post_cfg_mode)
+        self.ag_combine_mode: str = str(ag_combine_mode)
         self.safe_force_clean_swap: bool = bool(safe_force_clean_swap)
         self.uuid_only_noop: bool = bool(uuid_only_noop)
         self.debug_swap: bool = bool(debug_swap)
@@ -1204,6 +1214,11 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             uncond_for_good = negative_cond
 
             conds_good: List[Any] = [positive_cond, uncond_for_good]
+            ag_combine_mode = str(getattr(self, "ag_combine_mode", AG_COMBINE_MODE_SEQUENTIAL_DELTA))
+            w_cfg_paper = max(float(self.cfg) - 1.0, 0.0)
+            w_ag_paper = max(float(self.w_ag) - 1.0, 0.0)
+            cfg_effective_paper = 1.0 + w_cfg_paper + w_ag_paper
+            cond_scale_for_pre_cfg = cfg_effective_paper if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER else float(self.cfg)
 
             def _run_good(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
@@ -1241,6 +1256,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 active_patcher,
                 other_patcher,
                 options: Dict[str, Any],
+                cond_scale_override: Optional[float] = None,
             ) -> List[Any]:
                 out_cur = out_list
                 for fn in options.get("sampler_pre_cfg_function", []):
@@ -1250,7 +1266,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     args = {
                         "conds": conds_list,
                         "conds_out": out_cur,
-                        "cond_scale": self.cfg,
+                        "cond_scale": cond_scale_override if cond_scale_override is not None else self.cfg,
                         "timestep": timestep,
                         "input": x,
                         "sigma": timestep,
@@ -1267,6 +1283,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 active_patcher=self.model_patcher,
                 other_patcher=self.bad_model_patcher,
                 options=model_options,
+                cond_scale_override=cond_scale_for_pre_cfg,
             )
 
             cond_pred = out_good[0]
@@ -1282,29 +1299,60 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             else:
                 uncond_pred_good = uncond_pred
 
-            if "sampler_cfg_function" in model_options:
-                if shared_model:
-                    _activate(self.model_patcher, (self.bad_model_patcher,))
-                self.inner_model.current_patcher = self.model_patcher
-                args = {
-                    "cond": x - cond_pred,
-                    "uncond": x - uncond_pred,
-                    "cond_scale": self.cfg,
-                    "timestep": timestep,
-                    "input": x,
-                    "sigma": timestep,
-                    "cond_denoised": cond_pred_good,
-                    "uncond_denoised": uncond_pred_good,
-                    "model": self.inner_model,
-                    "model_options": model_options,
-                }
-                cfg_out = x - model_options["sampler_cfg_function"](args)
-            else:
-                cfg_out = uncond_pred + (cond_pred - uncond_pred) * self.cfg
+            cfg_out = None
+            if ag_combine_mode != AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER:
+                if "sampler_cfg_function" in model_options:
+                    if shared_model:
+                        _activate(self.model_patcher, (self.bad_model_patcher,))
+                    self.inner_model.current_patcher = self.model_patcher
+                    args = {
+                        "cond": x - cond_pred,
+                        "uncond": x - uncond_pred,
+                        "cond_scale": self.cfg,
+                        "timestep": timestep,
+                        "input": x,
+                        "sigma": timestep,
+                        "cond_denoised": cond_pred_good,
+                        "uncond_denoised": uncond_pred_good,
+                        "model": self.inner_model,
+                        "model_options": model_options,
+                    }
+                    cfg_out = x - model_options["sampler_cfg_function"](args)
+                else:
+                    cfg_out = uncond_pred + (cond_pred - uncond_pred) * self.cfg
 
+            # Fast path: AG disabled.
             if self.w_ag <= 1.0 + 1e-6:
-                denoised = cfg_out
-                for fn in model_options.get("sampler_post_cfg_function", []):
+                if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER:
+                    cfg_effective = 1.0 + w_cfg_paper
+                    origin = uncond_pred_good
+                    if "sampler_cfg_function" in model_options:
+                        if shared_model:
+                            _activate(self.model_patcher, (self.bad_model_patcher,))
+                        self.inner_model.current_patcher = self.model_patcher
+                        args = {
+                            "cond": x - cond_pred_good,
+                            "uncond": x - origin,
+                            "cond_scale": cfg_effective,
+                            "timestep": timestep,
+                            "input": x,
+                            "sigma": timestep,
+                            "cond_denoised": cond_pred_good,
+                            "uncond_denoised": origin,
+                            "model": self.inner_model,
+                            "model_options": model_options,
+                        }
+                        denoised = x - model_options["sampler_cfg_function"](args)
+                    else:
+                        denoised = origin + (cond_pred_good - origin) * cfg_effective
+                    cond_scale_for_hooks = cfg_effective
+                    uncond_denoised_for_hooks = origin
+                else:
+                    denoised = cfg_out
+                    cond_scale_for_hooks = self.cfg
+                    uncond_denoised_for_hooks = uncond_pred_good
+
+                for fn in post_cfg_fns:
                     if shared_model:
                         _activate(self.model_patcher, (self.bad_model_patcher,))
                     self.inner_model.current_patcher = self.model_patcher
@@ -1314,12 +1362,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                             "cond": positive_cond,
                             "uncond": uncond_for_good,
                             "model": self.inner_model,
-                            "uncond_denoised": uncond_pred_good,
+                            "uncond_denoised": uncond_denoised_for_hooks,
                             "cond_denoised": cond_pred_good,
                             "sigma": timestep,
                             "model_options": model_options,
                             "input": x,
-                            "cond_scale": self.cfg,
+                            "cond_scale": cond_scale_for_hooks,
                             "bad_model": self.inner_bad_model,
                             "bad_cond_denoised": None,
                             "autoguidance_w": self.w_ag,
@@ -1410,64 +1458,203 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     bad_model_options,
                 ), bad_model_options
 
-            try:
-                out_bad, bad_opts_used = _run_bad(conds_bad)
-            except AssertionError as e:
-                if "must specify y if and only if the model is class-conditional" not in str(e):
-                    raise
-                pos_bad_cond = _clone_cond_metadata(pos_bad_cond)
-                pos_bad_cond = _restore_y_per_entry(pos_bad_cond, positive_cond, negative_cond)
-                pos_bad_cond = _ensure_primary_text_cond(pos_bad_cond, positive_cond)
-                neg_bad = _clone_cond_metadata(uncond_for_good)
-                neg_bad = _restore_y_per_entry(neg_bad, positive_cond, negative_cond)
-                neg_bad = _ensure_primary_text_cond(neg_bad, uncond_for_good)
+            def _rebuild_bad_pos_from_good() -> Any:
+                rebuilt = _clone_cond_metadata(positive_cond)
+                rebuilt = _restore_y_per_entry(rebuilt, positive_cond, negative_cond)
+                rebuilt = _ensure_primary_text_cond(rebuilt, positive_cond)
                 if self.bad_conds is not None:
-                    self.bad_conds["positive"] = pos_bad_cond
-                    self.bad_conds["negative"] = neg_bad
-                conds_bad = [pos_bad_cond, neg_bad]
-                try:
-                    out_bad, bad_opts_used = _run_bad(conds_bad)
-                except RuntimeError as e2:
-                    if "mat1 and mat2 shapes cannot be multiplied" not in str(e2):
-                        raise
-                    pos_bad_cond = _clone_cond_metadata(positive_cond)
-                    pos_bad_cond = _restore_y_per_entry(pos_bad_cond, positive_cond, negative_cond)
-                    pos_bad_cond = _ensure_primary_text_cond(pos_bad_cond, positive_cond)
-                    neg_bad = _clone_cond_metadata(uncond_for_good)
-                    neg_bad = _restore_y_per_entry(neg_bad, positive_cond, negative_cond)
-                    neg_bad = _ensure_primary_text_cond(neg_bad, uncond_for_good)
-                    if self.bad_conds is not None:
-                        self.bad_conds["positive"] = pos_bad_cond
-                        self.bad_conds["negative"] = neg_bad
-                    conds_bad = [pos_bad_cond, neg_bad]
-                    out_bad, bad_opts_used = _run_bad(conds_bad)
-            except RuntimeError as e:
-                if "mat1 and mat2 shapes cannot be multiplied" not in str(e):
-                    raise
-                pos_bad_cond = _clone_cond_metadata(positive_cond)
-                pos_bad_cond = _restore_y_per_entry(pos_bad_cond, positive_cond, negative_cond)
-                pos_bad_cond = _ensure_primary_text_cond(pos_bad_cond, positive_cond)
-                neg_bad = _clone_cond_metadata(uncond_for_good)
-                neg_bad = _restore_y_per_entry(neg_bad, positive_cond, negative_cond)
-                neg_bad = _ensure_primary_text_cond(neg_bad, uncond_for_good)
-                if self.bad_conds is not None:
-                    self.bad_conds["positive"] = pos_bad_cond
-                    self.bad_conds["negative"] = neg_bad
-                conds_bad = [pos_bad_cond, neg_bad]
-                out_bad, bad_opts_used = _run_bad(conds_bad)
-            bad_cond_pred = out_bad[0]
-            bad_uncond_pred = out_bad[1]
+                    self.bad_conds["positive"] = rebuilt
+                return rebuilt
 
-            out_bad = _apply_pre_cfg_hooks(
-                conds_list=conds_bad,
-                out_list=out_bad,
-                run_model=self.inner_bad_model,
-                active_patcher=self.bad_model_patcher,
-                other_patcher=self.model_patcher,
-                options=bad_opts_used,
-            )
-            bad_cond_pred = out_bad[0]
-            bad_uncond_pred = out_bad[1]
+            def _rebuild_bad_neg_from_good() -> Any:
+                rebuilt = _clone_cond_metadata(uncond_for_good)
+                rebuilt = _restore_y_per_entry(rebuilt, positive_cond, negative_cond)
+                rebuilt = _ensure_primary_text_cond(rebuilt, uncond_for_good)
+                if self.bad_conds is not None:
+                    self.bad_conds["negative"] = rebuilt
+                return rebuilt
+
+            def _run_bad_full_with_fallback(pos_in: Any, neg_in: Any):
+                pos_local = pos_in
+                neg_local = neg_in
+                conds_local = [pos_local, neg_local]
+                try:
+                    return _run_bad(conds_local), conds_local
+                except AssertionError as e:
+                    if "must specify y if and only if the model is class-conditional" not in str(e):
+                        raise
+                    pos_local = _clone_cond_metadata(pos_local)
+                    pos_local = _restore_y_per_entry(pos_local, positive_cond, negative_cond)
+                    pos_local = _ensure_primary_text_cond(pos_local, positive_cond)
+                    neg_local = _rebuild_bad_neg_from_good()
+                    if self.bad_conds is not None:
+                        self.bad_conds["positive"] = pos_local
+                    conds_local = [pos_local, neg_local]
+                    try:
+                        return _run_bad(conds_local), conds_local
+                    except RuntimeError as e2:
+                        if "mat1 and mat2 shapes cannot be multiplied" not in str(e2):
+                            raise
+                        pos_local = _rebuild_bad_pos_from_good()
+                        neg_local = _rebuild_bad_neg_from_good()
+                        conds_local = [pos_local, neg_local]
+                        return _run_bad(conds_local), conds_local
+                except RuntimeError as e:
+                    if "mat1 and mat2 shapes cannot be multiplied" not in str(e):
+                        raise
+                    pos_local = _rebuild_bad_pos_from_good()
+                    neg_local = _rebuild_bad_neg_from_good()
+                    conds_local = [pos_local, neg_local]
+                    return _run_bad(conds_local), conds_local
+
+            if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER:
+                has_pre_cfg = bool(model_options.get("sampler_pre_cfg_function", []))
+                if has_pre_cfg:
+                    (out_bad, bad_opts_used), conds_bad = _run_bad_full_with_fallback(pos_bad_cond, neg_bad)
+                    out_bad = _apply_pre_cfg_hooks(
+                        conds_list=conds_bad,
+                        out_list=out_bad,
+                        run_model=self.inner_bad_model,
+                        active_patcher=self.bad_model_patcher,
+                        other_patcher=self.model_patcher,
+                        options=bad_opts_used,
+                        cond_scale_override=cond_scale_for_pre_cfg,
+                    )
+                    bad_cond_pred = out_bad[0]
+                    bad_uncond_pred = out_bad[1]
+                else:
+                    conds_bad = [pos_bad_cond]
+                    try:
+                        out_bad, bad_opts_used = _run_bad(conds_bad)
+                    except AssertionError as e:
+                        if "must specify y if and only if the model is class-conditional" not in str(e):
+                            raise
+                        pos_bad_cond = _rebuild_bad_pos_from_good()
+                        conds_bad = [pos_bad_cond]
+                        try:
+                            out_bad, bad_opts_used = _run_bad(conds_bad)
+                        except RuntimeError as e2:
+                            if "mat1 and mat2 shapes cannot be multiplied" not in str(e2):
+                                raise
+                            pos_bad_cond = _rebuild_bad_pos_from_good()
+                            conds_bad = [pos_bad_cond]
+                            out_bad, bad_opts_used = _run_bad(conds_bad)
+                    except RuntimeError as e:
+                        if "mat1 and mat2 shapes cannot be multiplied" not in str(e):
+                            raise
+                        pos_bad_cond = _rebuild_bad_pos_from_good()
+                        conds_bad = [pos_bad_cond]
+                        out_bad, bad_opts_used = _run_bad(conds_bad)
+
+                    out_bad = _apply_pre_cfg_hooks(
+                        conds_list=conds_bad,
+                        out_list=out_bad,
+                        run_model=self.inner_bad_model,
+                        active_patcher=self.bad_model_patcher,
+                        other_patcher=self.model_patcher,
+                        options=bad_opts_used,
+                        cond_scale_override=cond_scale_for_pre_cfg,
+                    )
+                    bad_cond_pred = out_bad[0]
+                    bad_uncond_pred = None
+            else:
+                (out_bad, bad_opts_used), conds_bad = _run_bad_full_with_fallback(pos_bad_cond, neg_bad)
+                bad_cond_pred = out_bad[0]
+                bad_uncond_pred = out_bad[1]
+
+                out_bad = _apply_pre_cfg_hooks(
+                    conds_list=conds_bad,
+                    out_list=out_bad,
+                    run_model=self.inner_bad_model,
+                    active_patcher=self.bad_model_patcher,
+                    other_patcher=self.model_patcher,
+                    options=bad_opts_used,
+                    cond_scale_override=cond_scale_for_pre_cfg,
+                )
+                bad_cond_pred = out_bad[0]
+                bad_uncond_pred = out_bad[1]
+
+            if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER:
+                w_cfg = w_cfg_paper
+                w_ag = w_ag_paper
+                w_sum = w_cfg + w_ag
+                cfg_effective = 1.0 + w_sum
+
+                if w_sum <= 1e-8:
+                    origin = uncond_pred_good
+                    denoised = cond_pred_good
+                else:
+                    origin = ((w_cfg * uncond_pred_good) + (w_ag * bad_cond_pred)) / w_sum
+                    if "sampler_cfg_function" in model_options:
+                        if shared_model:
+                            _activate(self.model_patcher, (self.bad_model_patcher,))
+                        self.inner_model.current_patcher = self.model_patcher
+                        args = {
+                            "cond": x - cond_pred_good,
+                            "uncond": x - origin,
+                            "cond_scale": cfg_effective,
+                            "timestep": timestep,
+                            "input": x,
+                            "sigma": timestep,
+                            "cond_denoised": cond_pred_good,
+                            "uncond_denoised": origin,
+                            "model": self.inner_model,
+                            "model_options": model_options,
+                        }
+                        denoised = x - model_options["sampler_cfg_function"](args)
+                    else:
+                        denoised = origin + (cond_pred_good - origin) * cfg_effective
+
+                denoised_before_post = denoised
+                for fn in post_cfg_fns:
+                    if shared_model:
+                        _activate(self.model_patcher, (self.bad_model_patcher,))
+                    self.inner_model.current_patcher = self.model_patcher
+                    args = {
+                        "denoised": denoised,
+                        "cond": positive_cond,
+                        "uncond": uncond_for_good,
+                        "model": self.inner_model,
+                        "uncond_denoised": origin,
+                        "cond_denoised": cond_pred_good,
+                        "sigma": timestep,
+                        "model_options": model_options,
+                        "input": x,
+                        "cond_scale": cfg_effective,
+                        "bad_model": self.inner_bad_model,
+                        "bad_cond_denoised": bad_cond_pred,
+                        "autoguidance_w": self.w_ag,
+                    }
+                    denoised = fn(args)
+
+                denoised_after_post = denoised
+                debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
+                if debug_metrics and (step == 0 or last):
+                    try:
+                        def _l2(t):
+                            return float(t.detach().float().pow(2).sum().sqrt().cpu())
+
+                        n_pre = _l2(denoised_before_post - cond_pred_good)
+                        n_post = _l2(denoised_after_post - cond_pred_good)
+                        n_change = _l2(denoised_after_post - denoised_before_post)
+                        print(
+                            "[AutoGuidance] paper_multi_post_cfg_effect_step",
+                            step,
+                            {
+                                "cond_scale_effective": float(cfg_effective),
+                                "w_cfg": float(w_cfg),
+                                "w_ag": float(w_ag),
+                                "n_pre_minus_cond": n_pre,
+                                "n_post_minus_cond": n_post,
+                                "n_post_change": n_change,
+                            },
+                        )
+                    except Exception as e:
+                        print("[AutoGuidance] paper_multi_post_cfg_effect failed", repr(e))
+
+                if shared_model:
+                    _activate(self.model_patcher, (self.bad_model_patcher,))
+                return denoised
 
             dbg = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
             if dbg and step == 0 and not hasattr(self, "_ag_dbg_post_cfg_once"):
@@ -1722,6 +1909,7 @@ class AutoGuidanceCFGGuider:
             },
             "optional": {
                 # If AG looks too subtle, increase ag_max_ratio first (0.35 -> 0.75).
+                "ag_combine_mode": (AG_COMBINE_MODE_CHOICES, {"default": AG_COMBINE_MODE_SEQUENTIAL_DELTA}),
                 "ag_delta_mode": (AG_DELTA_MODE_CHOICES, {"default": AG_DELTA_MODE_BAD_CONDITIONAL}),
                 "ag_max_ratio": (
                     "FLOAT",
@@ -1771,6 +1959,7 @@ class AutoGuidanceCFGGuider:
         cfg: float,
         w_autoguide: float,
         swap_mode=AG_SWAP_MODE_SHARED_SAFE,
+        ag_combine_mode=AG_COMBINE_MODE_SEQUENTIAL_DELTA,
         ag_delta_mode=AG_DELTA_MODE_BAD_CONDITIONAL,
         ag_max_ratio=AG_DEFAULT_MAX_RATIO,
         ag_allow_negative=True,
@@ -1787,6 +1976,7 @@ class AutoGuidanceCFGGuider:
             good_model,
             bad_model,
             swap_mode=swap_mode,
+            ag_combine_mode=ag_combine_mode,
             ag_delta_mode=ag_delta_mode,
             ag_max_ratio=ag_max_ratio,
             ag_allow_negative=ag_allow_negative,
@@ -1992,6 +2182,7 @@ class AutoGuidanceImpactDetailerHook(_ImpactDetailerHook):
         *,
         w_autoguide: float = 2.0,
         swap_mode: str = AG_SWAP_MODE_SHARED_SAFE,
+        ag_combine_mode: str = AG_COMBINE_MODE_SEQUENTIAL_DELTA,
         ag_delta_mode: str = AG_DELTA_MODE_BAD_CONDITIONAL,
         ag_max_ratio: float = AG_DEFAULT_MAX_RATIO,
         ag_allow_negative: bool = True,
@@ -2008,6 +2199,7 @@ class AutoGuidanceImpactDetailerHook(_ImpactDetailerHook):
         self.bad_model = bad_model
         self.w_autoguide = float(w_autoguide)
         self.swap_mode = str(swap_mode)
+        self.ag_combine_mode = str(ag_combine_mode)
         self.ag_delta_mode = str(ag_delta_mode)
         self.ag_max_ratio = float(ag_max_ratio)
         self.ag_allow_negative = bool(ag_allow_negative)
@@ -2031,6 +2223,7 @@ class AutoGuidanceImpactDetailerHook(_ImpactDetailerHook):
             model,
             self.bad_model,
             swap_mode=self.swap_mode,
+            ag_combine_mode=self.ag_combine_mode,
             ag_delta_mode=self.ag_delta_mode,
             ag_max_ratio=self.ag_max_ratio,
             ag_allow_negative=self.ag_allow_negative,
@@ -2077,6 +2270,7 @@ class AutoGuidanceImpactDetailerHookProvider:
             },
             "optional": {
                 "ag_delta_mode": (AG_DELTA_MODE_CHOICES, {"default": AG_DELTA_MODE_BAD_CONDITIONAL}),
+                "ag_combine_mode": (AG_COMBINE_MODE_CHOICES, {"default": AG_COMBINE_MODE_SEQUENTIAL_DELTA}),
                 "ag_max_ratio": ("FLOAT", {"default": AG_DEFAULT_MAX_RATIO, "min": 0.0, "max": 2.0, "step": 0.05, "round": 0.01}),
                 "ag_allow_negative": ("BOOLEAN", {"default": True}),
                 "ag_ramp_mode": (AG_RAMP_MODE_CHOICES, {"default": AG_RAMP_FLAT}),
@@ -2099,6 +2293,7 @@ class AutoGuidanceImpactDetailerHookProvider:
         bad_model,
         w_autoguide: float,
         swap_mode=AG_SWAP_MODE_SHARED_SAFE,
+        ag_combine_mode=AG_COMBINE_MODE_SEQUENTIAL_DELTA,
         ag_delta_mode=AG_DELTA_MODE_BAD_CONDITIONAL,
         ag_max_ratio=AG_DEFAULT_MAX_RATIO,
         ag_allow_negative=True,
@@ -2115,6 +2310,7 @@ class AutoGuidanceImpactDetailerHookProvider:
             bad_model,
             w_autoguide=w_autoguide,
             swap_mode=swap_mode,
+            ag_combine_mode=ag_combine_mode,
             ag_delta_mode=ag_delta_mode,
             ag_max_ratio=ag_max_ratio,
             ag_allow_negative=ag_allow_negative,
