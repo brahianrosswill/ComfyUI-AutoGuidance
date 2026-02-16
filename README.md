@@ -137,6 +137,7 @@ Core idea: bad side should be meaningfully weaker/less specialized than good sid
 
 - `cfg: 1.1`
 - `w_autoguide: 3.00`
+  - note: in `multi_guidance_paper`, values above `2.0` clamp to `α=1.0` (pure AG share).
 - `swap_mode: dual_models_2x_vram`
 - `ag_delta_mode: reject_cfg`
 - `ag_max_ratio: 0.75`
@@ -152,18 +153,23 @@ Core idea: bad side should be meaningfully weaker/less specialized than good sid
 
 ## Practical tuning notes
 
-- Increase `w_autoguide` above `1.0` to strengthen effect.
+- In non-paper modes, increase `w_autoguide` above `1.0` to strengthen effect.
 - In `multi_guidance_paper` mode, weights are interpreted as:
-  - `w_cfg = max(cfg - 1, 0)`
-  - `w_ag = max(w_autoguide - 1, 0)`
-  - output = `(1 + w_cfg + w_ag) * C - w_cfg * U - w_ag * B`
-    where `C` = good conditional, `U` = good negative/uncond, `B` = bad conditional.
-- To reproduce fixed-total-guidance interpolation from the paper (`g`, mix `α`):
-  - `cfg = 1 + (g - 1)(1 - α)`
-  - `w_autoguide = 1 + (g - 1)α`
+  - `α = clamp(w_autoguide - 1, 0, 1)`
+  - `w_total = max(cfg - 1, 0)`
+  - `w_cfg = (1 - α) * w_total`
+  - `w_ag = α * w_total`
+  - CFG leg uses `cfg_scale = 1 + w_cfg` (including sampler CFG hooks).
+  - final output = `CFG(good, cfg_scale) + w_ag * (C - B)`
+    where `C` = good conditional and `B` = bad conditional.
+- To set paper interpolation directly (total `g`, mix `α`):
+  - `cfg = g`
+  - `w_autoguide = 1 + α`
   - `ag_combine_mode = multi_guidance_paper`
-- In `multi_guidance_paper`, `ag_post_cfg_mode` only controls whether post-CFG hooks run (`skip`); there is no separate AG "apply after" stage.
-- Use `ag_max_ratio` to prevent runaway/cooked outputs.
+- In `multi_guidance_paper`, `ag_post_cfg_mode` still works:
+  - `keep`/`skip`: AG is mixed before post-CFG hooks.
+  - `apply_after`: run post-CFG hooks on CFG-only output, then add AG delta.
+- In `multi_guidance_paper`, `ag_delta_mode`, `ag_max_ratio`, `ag_ramp_mode`, `ag_ramp_power`, and `ag_ramp_floor` are currently ignored.
 - `compose_early` tends to affect composition/structure earlier in denoise.
 - Try `detail_late` for a more late-step/detail-leaning influence.
 

@@ -1217,19 +1217,15 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             conds_good: List[Any] = [positive_cond, uncond_for_good]
             ag_combine_mode = str(getattr(self, "ag_combine_mode", AG_COMBINE_MODE_SEQUENTIAL_DELTA))
-            # Paper-style multi-guidance (Karras et al.) is typically parameterized with
-            # non-negative weights w_cfg,w_ag and uses cfg>=1 as the "no-guidance" baseline.
-            #
-            # In practice it is also useful to run CFG < 1.0 (interpolating towards uncond),
-            # while still using multi-guidance.
-            #
-            # Allow cfg < 1.0 by not clamping (cfg=1.0 -> w_cfg=0, cfg<1.0 -> w_cfg<0).
-            w_cfg_paper = float(self.cfg) - 1.0
-            w_ag_paper = max(float(self.w_ag) - 1.0, 0.0)
-            cfg_effective_paper = 1.0 + w_cfg_paper + w_ag_paper
-            # IMPORTANT: pre-CFG hooks expect the *actual CFG*.
-            # Do NOT fold AutoGuidance weight into cond_scale; it is not CFG and breaks hook assumptions.
-            cond_scale_for_pre_cfg = float(self.cfg)
+            # Paper multi-guidance (Appendix B.2): split one total guidance budget
+            # between CFG and AutoGuidance with interpolation alpha.
+            alpha_paper = max(0.0, min(1.0, float(self.w_ag) - 1.0))
+            w_total_paper = max(float(self.cfg) - 1.0, 0.0)
+            w_cfg_paper = (1.0 - alpha_paper) * w_total_paper
+            w_ag_paper = alpha_paper * w_total_paper
+            cfg_scale_used_paper = 1.0 + w_cfg_paper
+            # IMPORTANT: pre-CFG hooks expect the *actual CFG* used for this step.
+            cond_scale_for_pre_cfg = cfg_scale_used_paper if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER else float(self.cfg)
 
             def _run_good(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
@@ -1332,12 +1328,13 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 else:
                     cfg_out = uncond_pred + (cond_pred - uncond_pred) * self.cfg
 
+            paper_mode = ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER
+            ag_disabled = (w_ag_paper <= 1e-6) if paper_mode else (self.w_ag <= 1.0 + 1e-6)
+
             # Fast path: AG disabled.
-            if self.w_ag <= 1.0 + 1e-6:
+            if ag_disabled:
                 if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER:
-                    # IMPORTANT: in paper mode, cfg<1 must remain effective.
-                    # Using (1 + w_cfg_paper) can break if w_cfg_paper is clamped anywhere.
-                    cfg_effective = float(self.cfg)
+                    cfg_effective = float(cfg_scale_used_paper)
                     origin = uncond_pred_good
                     if "sampler_cfg_function" in model_options:
                         if shared_model:
@@ -1537,8 +1534,21 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             bad_uncond_pred = out_bad[1]
 
             if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER:
-                cfg = float(self.cfg)
-                w_ag = w_ag_paper
+                cfg_effective = float(cfg_scale_used_paper)
+                w_cfg = float(w_cfg_paper)
+                w_ag = float(w_ag_paper)
+
+                if step == 0 and not hasattr(self, "_ag_dbg_paper_weights_once"):
+                    print(
+                        "[AutoGuidance] paper_multi_weights",
+                        {
+                            "alpha_paper": float(alpha_paper),
+                            "w_total_paper": float(w_total_paper),
+                            "cfg_scale_used_paper": float(cfg_scale_used_paper),
+                            "w_ag_paper": float(w_ag_paper),
+                        },
+                    )
+                    self._ag_dbg_paper_weights_once = True
 
                 # Build the CFG leg first (respecting sampler_cfg_function when provided),
                 # then add paper-mode AutoGuidance delta.
@@ -1550,7 +1560,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     args = {
                         "cond": x - cond_pred_good,
                         "uncond": x - uncond_pred_good,
-                        "cond_scale": float(self.cfg),
+                        "cond_scale": cfg_effective,
                         "timestep": timestep,
                         "input": x,
                         "sigma": timestep,
@@ -1561,95 +1571,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     }
                     cfg_out = x - model_options["sampler_cfg_function"](args)
                 else:
-                    cfg_out = uncond_pred_good + (cond_pred_good - uncond_pred_good) * float(self.cfg)
+                    cfg_out = uncond_pred_good + (cond_pred_good - uncond_pred_good) * cfg_effective
 
-                # --- Match sequential_delta behavior: direction selection + ramped cap ---
-                d_cfg = cond_pred_good - uncond_pred_good
-                cfg_update_dir = cfg_out - uncond_pred_good  # actual applied CFG update direction
-                d_ag_cond = cond_pred_good - bad_cond_pred   # conditional good-vs-bad direction
-
-                w = w_ag
-                if w <= 0.0:
-                    ag_delta = None
-                else:
-                    mode = getattr(self, "ag_delta_mode", AG_DELTA_MODE_BAD_CONDITIONAL)
-                    allow_neg = bool(getattr(self, "ag_allow_negative", True))
-
-                    if mode == AG_DELTA_MODE_PROJECT_CFG:
-                        cfg_denom = _dot_per_sample(cfg_update_dir, cfg_update_dir)
-                        alpha = _dot_per_sample(d_ag_cond, cfg_update_dir) / (cfg_denom + 1e-8)
-                        if not allow_neg:
-                            alpha = torch.clamp(alpha, min=0.0)
-                        d_ag_dir = cfg_update_dir * _expand_batch_scale(alpha.to(cfg_update_dir.dtype), cfg_update_dir)
-
-                    elif mode == AG_DELTA_MODE_REJECT_CFG:
-                        cfg_denom = _dot_per_sample(cfg_update_dir, cfg_update_dir)
-                        alpha = _dot_per_sample(d_ag_cond, cfg_update_dir) / (cfg_denom + 1e-8)
-                        if not allow_neg:
-                            alpha = torch.clamp(alpha, min=0.0)
-                        d_ag_dir = d_ag_cond - cfg_update_dir * _expand_batch_scale(alpha.to(cfg_update_dir.dtype), cfg_update_dir)
-
-                    elif mode == AG_DELTA_MODE_RAW:
-                        # Needs bad CFG output; if you want RAW in paper mode, you must ensure bad_uncond_pred exists.
-                        # Easiest: force the full bad pass (cond+uncond) in paper mode, same as sequential_delta.
-                        if bad_uncond_pred is None:
-                            # Fall back rather than silently doing something else.
-                            d_ag_dir = d_ag_cond
-                        else:
-                            if "sampler_cfg_function" in model_options:
-                                if shared_model:
-                                    _activate(self.bad_model_patcher, (self.model_patcher,))
-                                self.inner_bad_model.current_patcher = self.bad_model_patcher
-                                args_bad = {
-                                    "cond": x - bad_cond_pred,
-                                    "uncond": x - bad_uncond_pred,
-                                    "cond_scale": float(self.cfg),
-                                    "timestep": timestep,
-                                    "input": x,
-                                    "sigma": timestep,
-                                    "cond_denoised": bad_cond_pred,
-                                    "uncond_denoised": bad_uncond_pred,
-                                    "model": self.inner_bad_model,
-                                    "model_options": bad_opts_used,
-                                }
-                                bad_cfg_out = x - model_options["sampler_cfg_function"](args_bad)
-                            else:
-                                bad_cfg_out = bad_uncond_pred + (bad_cond_pred - bad_uncond_pred) * float(self.cfg)
-                            d_ag_dir = cfg_out - bad_cfg_out
-
-                    else:
-                        d_ag_dir = d_ag_cond
-
-                    ag_delta = w * d_ag_dir
-
-                    # Cap magnitude relative to actually applied CFG update (with ramp scaling the ratio, not w)
-                    max_ratio = float(getattr(self, "ag_max_ratio", AG_DEFAULT_MAX_RATIO))
-                    if max_ratio > 0.0:
-                        n_cfg = _norm_per_sample(cfg_update_dir)
-                        n_delta = _norm_per_sample(ag_delta)
-
-                        ratio = max_ratio
-                        total_steps = getattr(self, "_ag_steps_total", None)
-                        if total_steps is not None and int(total_steps) > 1:
-                            prog = float(step) / float(int(total_steps) - 1)
-                            prog = max(0.0, min(1.0, prog))
-                            ramp_mode = str(getattr(self, "ag_ramp_mode", AG_RAMP_FLAT))
-                            ramp_power = float(getattr(self, "ag_ramp_power", 2.0))
-                            ramp_floor = float(getattr(self, "ag_ramp_floor", 0.0))
-                            ramp_floor = max(0.0, min(1.0, ramp_floor))
-                            ramp_factor = _ag_ramp_factor(prog, mode=ramp_mode, power=ramp_power)
-                            ratio = max_ratio * (ramp_floor + (1.0 - ramp_floor) * ramp_factor)
-
-                        n_cfg_fallback = _norm_per_sample(d_cfg)
-                        n_cfg_ref = torch.where(n_cfg > 1e-6, n_cfg, n_cfg_fallback)
-                        limit = ratio * n_cfg_ref
-                        scale = torch.clamp(limit / (n_delta + 1e-8), max=1.0)
-                        ag_delta = ag_delta * _expand_batch_scale(scale.to(ag_delta.dtype), ag_delta)
+                ag_delta = None if w_ag <= 0.0 else (cond_pred_good - bad_cond_pred) * w_ag
 
                 # Apply
                 denoised = cfg_out if ag_delta is None else (cfg_out + ag_delta)
-                cfg_effective = cfg
-                w_cfg = cfg - 1.0
 
                 if post_cfg_mode == AG_POST_CFG_APPLY_AFTER:
                     denoised = cfg_out
@@ -1669,7 +1596,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         "sigma": timestep,
                         "model_options": model_options,
                         "input": x,
-                        "cond_scale": float(self.cfg),
+                        "cond_scale": cfg_effective,
                         "bad_model": self.inner_bad_model,
                         "bad_cond_denoised": bad_cond_pred,
                         "autoguidance_w": self.w_ag,
