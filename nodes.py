@@ -1227,7 +1227,9 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             w_cfg_paper = float(self.cfg) - 1.0
             w_ag_paper = max(float(self.w_ag) - 1.0, 0.0)
             cfg_effective_paper = 1.0 + w_cfg_paper + w_ag_paper
-            cond_scale_for_pre_cfg = cfg_effective_paper if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER else float(self.cfg)
+            # IMPORTANT: pre-CFG hooks expect the *actual CFG*.
+            # Do NOT fold AutoGuidance weight into cond_scale; it is not CFG and breaks hook assumptions.
+            cond_scale_for_pre_cfg = float(self.cfg)
 
             def _run_good(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
@@ -1317,7 +1319,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     args = {
                         "cond": x - cond_pred,
                         "uncond": x - uncond_pred,
-                        "cond_scale": self.cfg,
+                        "cond_scale": float(self.cfg),
                         "timestep": timestep,
                         "input": x,
                         "sigma": timestep,
@@ -1589,49 +1591,36 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 cfg = float(self.cfg)
                 w_ag = w_ag_paper
 
-                # If no sampler_cfg_function is installed, use the closed-form paper update:
-                # denoised = U + cfg*(C-U) + w_ag*(C-B)
-                # This guarantees cfg<1 changes output (no origin/w_sum edge cases).
-                if "sampler_cfg_function" not in model_options:
-                    denoised = (
-                        uncond_pred_good
-                        + (cond_pred_good - uncond_pred_good) * cfg
-                        + (cond_pred_good - bad_cond_pred) * w_ag
-                    )
-                    origin = uncond_pred_good
-                    cfg_effective = cfg
-                    w_cfg = cfg - 1.0
+                # Build the CFG leg first (respecting sampler_cfg_function when provided),
+                # then add paper-mode AutoGuidance delta.
+                cfg_out = None
+                if "sampler_cfg_function" in model_options:
+                    if shared_model:
+                        _activate(self.model_patcher, (self.bad_model_patcher,))
+                    self.inner_model.current_patcher = self.model_patcher
+                    args = {
+                        "cond": x - cond_pred_good,
+                        "uncond": x - uncond_pred_good,
+                        "cond_scale": float(self.cfg),
+                        "timestep": timestep,
+                        "input": x,
+                        "sigma": timestep,
+                        "cond_denoised": cond_pred_good,
+                        "uncond_denoised": uncond_pred_good,
+                        "model": self.inner_model,
+                        "model_options": model_options,
+                    }
+                    cfg_out = x - model_options["sampler_cfg_function"](args)
                 else:
-                    # Keep sampler_cfg_function compatibility via origin+cond_scale form.
-                    w_cfg = cfg - 1.0
-                    w_sum = w_cfg + w_ag
-                    cfg_effective = 1.0 + w_sum
+                    cfg_out = uncond_pred_good + (cond_pred_good - uncond_pred_good) * float(self.cfg)
 
-                    if abs(w_sum) <= 1e-8:
-                        origin = uncond_pred_good
-                        denoised = (
-                            (1.0 + w_sum) * cond_pred_good
-                            - (w_cfg * uncond_pred_good)
-                            - (w_ag * bad_cond_pred)
-                        )
-                    else:
-                        origin = ((w_cfg * uncond_pred_good) + (w_ag * bad_cond_pred)) / w_sum
-                        if shared_model:
-                            _activate(self.model_patcher, (self.bad_model_patcher,))
-                        self.inner_model.current_patcher = self.model_patcher
-                        args = {
-                            "cond": x - cond_pred_good,
-                            "uncond": x - origin,
-                            "cond_scale": cfg_effective,
-                            "timestep": timestep,
-                            "input": x,
-                            "sigma": timestep,
-                            "cond_denoised": cond_pred_good,
-                            "uncond_denoised": origin,
-                            "model": self.inner_model,
-                            "model_options": model_options,
-                        }
-                        denoised = x - model_options["sampler_cfg_function"](args)
+                ag_delta = (cond_pred_good - bad_cond_pred) * w_ag
+                denoised = cfg_out + ag_delta
+                cfg_effective = cfg
+                w_cfg = cfg - 1.0
+
+                if post_cfg_mode == AG_POST_CFG_APPLY_AFTER:
+                    denoised = cfg_out
 
                 denoised_before_post = denoised
                 for fn in post_cfg_fns:
@@ -1643,12 +1632,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         "cond": positive_cond,
                         "uncond": uncond_for_good,
                         "model": self.inner_model,
-                        "uncond_denoised": origin,
+                        "uncond_denoised": uncond_pred_good,
                         "cond_denoised": cond_pred_good,
                         "sigma": timestep,
                         "model_options": model_options,
                         "input": x,
-                        "cond_scale": cfg_effective,
+                        "cond_scale": float(self.cfg),
                         "bad_model": self.inner_bad_model,
                         "bad_cond_denoised": bad_cond_pred,
                         "autoguidance_w": self.w_ag,
@@ -1656,6 +1645,10 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     denoised = fn(args)
 
                 denoised_after_post = denoised
+
+                if post_cfg_mode == AG_POST_CFG_APPLY_AFTER:
+                    denoised = denoised + ag_delta
+
                 debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
                 debug_all = bool(getattr(self, "debug_metrics_all", False)) or (os.environ.get("AG_DEBUG_METRICS_ALL", "0") == "1")
                 if debug_metrics and (debug_all or step == 0 or last):
