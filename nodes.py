@@ -1468,6 +1468,16 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     bad_model_options,
                 ), bad_model_options
 
+            # Flux crashes if it receives context=None (it does context.shape).
+            # Detect Flux by module name to avoid masking unrelated AttributeErrors.
+            is_flux_bad = False
+            try:
+                dm = getattr(self.inner_bad_model, "diffusion_model", None)
+                mod = getattr(getattr(dm, "__class__", None), "__module__", "") or ""
+                is_flux_bad = ("flux" in mod) and ("comfy.ldm" in mod)
+            except Exception:
+                is_flux_bad = False
+
             def _rebuild_bad_pos_from_good() -> Any:
                 rebuilt = _clone_cond_metadata(positive_cond)
                 rebuilt = _restore_y_per_entry(rebuilt, positive_cond, negative_cond)
@@ -1490,6 +1500,15 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 conds_local = [pos_local, neg_local]
                 try:
                     return _run_bad(conds_local), conds_local
+                except AttributeError as e:
+                    # Flux: "'NoneType' object has no attribute 'shape'" when context is missing.
+                    msg = str(e)
+                    if is_flux_bad and ("NoneType" in msg and "has no attribute 'shape'" in msg):
+                        pos_local = _rebuild_bad_pos_from_good()
+                        neg_local = _rebuild_bad_neg_from_good()
+                        conds_local = [pos_local, neg_local]
+                        return _run_bad(conds_local), conds_local
+                    raise
                 except AssertionError as e:
                     if "must specify y if and only if the model is class-conditional" not in str(e):
                         raise
